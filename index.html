@@ -90,6 +90,17 @@
 
     .brand .dims .x { color: var(--ink-faint); }
 
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+    }
+
+    .source-actions {
+      display: flex;
+      gap: 8px;
+    }
+
     .status {
       display: flex;
       align-items: center;
@@ -293,13 +304,19 @@
         <h1>GridLab</h1>
         <span class="dims"><span id="dimRows">0</span><span class="x">×</span><span id="dimCols">0</span></span>
       </div>
-      <div class="status"><span class="dot"></span> DuckDB connected · local</div>
+      <div class="topbar-right">
+        <div class="source-actions">
+          <button class="ghost" id="demoBtn">Demo Data</button>
+          <button id="openFileBtn">Open File…</button>
+        </div>
+        <div class="status"><span class="dot"></span> <span id="statusText">DuckDB connected · local</span></div>
+      </div>
     </div>
 
     <div class="card">
       <div class="console">
         <span class="prompt">›</span>
-        <input type="text" id="searchInput" placeholder="department = 'Engineering'">
+        <input type="text" id="searchInput" placeholder="department = Engineering">
         <button id="searchBtn">Run</button>
         <button class="ghost" id="resetBtn">Reset</button>
       </div>
@@ -313,7 +330,7 @@
 
       <div class="footer">
         <div class="footer-top">
-          <span><strong id="loadedCount">0</strong> / 100,000 rows loaded</span>
+          <span><strong id="loadedCount">0</strong> / <span id="totalRowsLabel">100,000</span> rows loaded</span>
           <span id="loadedPct">0%</span>
         </div>
         <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
@@ -326,7 +343,7 @@
   <script>
     let offset = 0;
     const batchSize = 50;
-    const totalRows = 100000;
+    let totalRows = 100000; // updated when a CSV with a different row count is opened
     let loading = false;
     let loadedTotal = 0;
     let searchMode = false; // true while showing filtered search results
@@ -367,11 +384,12 @@
       const pct = Math.min(100, (loadedTotal / totalRows) * 100);
       document.getElementById('loadedPct').textContent = pct.toFixed(2) + '%';
       document.getElementById('progressFill').style.width = pct + '%';
-      // The dims badge always reflects the full sheet, not the current
-      // search result count, so it stays a stable "this is the sheet's
-      // shape" readout even while filtering.
+      // The dims badge and total-rows label always reflect the full sheet,
+      // not the current search result count, so they stay a stable
+      // "this is the sheet's shape" readout even while filtering.
       if (!searchMode) {
         document.getElementById('dimRows').textContent = totalRows.toLocaleString();
+        document.getElementById('totalRowsLabel').textContent = totalRows.toLocaleString();
       }
     }
 
@@ -419,7 +437,22 @@
       }
     });
 
-    document.getElementById('searchBtn').addEventListener('click', async () => {
+    // Shared by the Reset button and by switching data sources — clears
+    // search/scroll state and reloads from the top of whatever dataset
+    // (demo or CSV) is currently active.
+    function resetGridState() {
+      document.getElementById('searchInput').value = '';
+      document.getElementById('hintText').textContent =
+        "Only the rows you've scrolled to are ever loaded into memory.";
+      searchMode = false;
+      endReached = false;
+      offset = 0;
+      loadedTotal = 0;
+      document.getElementById('scrollBox').scrollTop = 0;
+      loadMore();
+    }
+
+    async function runSearch() {
       const where = document.getElementById('searchInput').value;
       const result = await window.gridlabAPI.runQuery(where);
       if (result.error) {
@@ -433,17 +466,37 @@
       updateCount(rows.length, true);
       document.getElementById('hintText').textContent =
         `Showing ${rows.length} search result(s). Click Reset to browse the full dataset again.`;
+    }
+
+    document.getElementById('searchBtn').addEventListener('click', runSearch);
+
+    document.getElementById('searchInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') runSearch();
     });
 
-    document.getElementById('resetBtn').addEventListener('click', () => {
-      document.getElementById('searchInput').value = '';
-      document.getElementById('hintText').textContent =
-        "Only the rows you've scrolled to are ever loaded into memory.";
-      searchMode = false;
-      endReached = false;
-      offset = 0;
-      document.getElementById('scrollBox').scrollTop = 0; // fix: return scroll position to the top
-      loadMore();
+    document.getElementById('resetBtn').addEventListener('click', resetGridState);
+
+    document.getElementById('openFileBtn').addEventListener('click', async () => {
+      const result = await window.gridlabAPI.openFile();
+      if (result.canceled) return; // user closed the file picker without choosing anything
+      if (result.error) {
+        showError(result.error);
+        return;
+      }
+      totalRows = result.rowCount;
+      document.getElementById('statusText').textContent = `DuckDB connected · ${result.fileName}`;
+      resetGridState();
+    });
+
+    document.getElementById('demoBtn').addEventListener('click', async () => {
+      const result = await window.gridlabAPI.useDemoData();
+      if (result.error) {
+        showError(result.error);
+        return;
+      }
+      totalRows = result.rowCount;
+      document.getElementById('statusText').textContent = 'DuckDB connected · local';
+      resetGridState();
     });
 
     loadMore();
