@@ -1,0 +1,26 @@
+{
+  "name": "gridlab-prototype",
+  "version": "1.0.0",
+  "description": "",
+  "main": "main.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "electron ."
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "^11.21.0",
+      "onFail": "download"
+    }
+  },
+  "devDependencies": {
+    "electron": "^43.3.0"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "1.5.5-r.3"
+  }
+}

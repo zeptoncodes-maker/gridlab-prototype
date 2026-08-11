@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html>
+  <head><title>GridLab Prototype</title></head>
+  <body>
+    <h1>GridLab Prototype (100,000 rows)</h1>
+    <input type="text" id="searchInput" placeholder="e.g. age > 40" style="width: 300px;">
+    <button id="searchBtn">Search</button>
+    <div id="scrollBox" style="height: 400px; overflow-y: scroll; border: 1px solid black;">
+      <table border="1" id="grid" style="width: 100%;"></table>
+    </div>
+
+    <script>
+      let offset = 0;
+      const batchSize = 50;
+      let loading = false;
+
+      async function loadMore() {
+        if (loading) return;
+        loading = true;
+        const rows = await window.gridlabAPI.getRows(offset, batchSize);
+        const table = document.getElementById('grid');
+
+        if (offset === 0) {
+          const headerRow = document.createElement('tr');
+          Object.keys(rows[0]).forEach(key => {
+            const th = document.createElement('th');
+            th.textContent = key;
+            headerRow.appendChild(th);
+          });
+          table.appendChild(headerRow);
+        }
+
+        rows.forEach(row => {
+          const tr = document.createElement('tr');
+          Object.values(row).forEach(val => {
+            const td = document.createElement('td');
+            td.textContent = val;
+            tr.appendChild(td);
+          });
+          table.appendChild(tr);
+        });
+
+        offset += batchSize;
+        loading = false;
+      }
+
+      document.getElementById('scrollBox').addEventListener('scroll', (e) => {
+        const box = e.target;
+        if (box.scrollTop + box.clientHeight >= box.scrollHeight - 50) {
+          loadMore();
+        }
+      });
+      document.getElementById('searchBtn').addEventListener('click', async () => {
+  const where = document.getElementById('searchInput').value;
+  const rows = await window.gridlabAPI.runQuery(where);
+  const table = document.getElementById('grid');
+  table.innerHTML = '';
+
+  const headerRow = document.createElement('tr');
+  Object.keys(rows[0] || { id: '', name: '', age: '' }).forEach(key => {
+    const th = document.createElement('th');
+    th.textContent = key;
+    headerRow.appendChild(th);
+  });
+  table.appendChild(headerRow);
+
+  rows.forEach(row => {
+    const tr = document.createElement('tr');
+    Object.values(row).forEach(val => {
+      const td = document.createElement('td');
+      td.textContent = val;
+      tr.appendChild(td);
+    });
+    table.appendChild(tr);
+  });
+});
+      loadMore();
+    </script>
+  </body>
+</html>
