@@ -1,0 +1,13 @@
+# pnpm, by design, keeps node_modules strict/isolated — a package can only
+# require() its own declared dependencies, not anything else that happens
+# to be installed elsewhere in the tree. Electron's own postinstall script
+# (install.js) does a plain `require('@electron/get')` that assumes a
+# flatter, npm/yarn-style node_modules layout. Under pnpm's strict default,
+# that lookup fails with "Cannot find module '@electron/get'" even though
+# the package genuinely is installed somewhere in the tree — pnpm just
+# won't let electron's script see it. This is a known, common pnpm+Electron
+# friction point, not specific to this project or this machine.
+# shamefully-hoist flattens node_modules similarly to npm/yarn, which lets
+# postinstall scripts like Electron's find dependencies the way they
+# expect, without changing anything about how the app itself is coded.
+shamefully-hoist=true
