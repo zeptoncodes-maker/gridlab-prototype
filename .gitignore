@@ -1,1 +1,5 @@
 node_modules/
+out/
+*.duckdb
+*.duckdb.wal
+*.gridlab/
