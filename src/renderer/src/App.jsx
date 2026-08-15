@@ -8,6 +8,7 @@ export default function App() {
   const [mutationLogVersion, setMutationLogVersion] = useState(0); // bump to make MutationPanel refetch
   const [projectDir, setProjectDir] = useState(null);
   const [pendingCount, setPendingCount] = useState(0); // unsaved edits currently staged in GridPanel
+  const [mutationPanelOpen, setMutationPanelOpen] = useState(false); // Mutation Log is now a toggleable drawer, not a permanent sidebar — see openNewProjectModal's comment on why the grid needed the full width back
 
   // New-project name entry. window.prompt() is not implemented in
   // Electron's renderer at all (Electron supports alert()/confirm() but
@@ -59,9 +60,18 @@ export default function App() {
   }
 
   function confirmDiscardForProjectSwitch() {
-    return window.confirm(
+    const ok = window.confirm(
       `You have ${pendingCount} unsaved change${pendingCount === 1 ? '' : 's'} in the current dataset. Discard ${pendingCount === 1 ? 'it' : 'them'} and continue?`
     );
+    // FIX: see the matching comment on confirmDiscardPendingEdits in
+    // GridPanel.jsx — Electron's native confirm() dialog can leave the
+    // window's keyboard focus stuck afterward, silently blocking inputs
+    // like the search box until the window is blurred and refocused.
+    setTimeout(() => {
+      window.focus();
+      document.body.focus();
+    }, 50);
+    return ok;
   }
 
   async function handleOpenProject() {
@@ -97,6 +107,7 @@ export default function App() {
           <div className="source-actions">
             <button className="ghost" onClick={openNewProjectModal}>New Project…</button>
             <button className="ghost" onClick={handleOpenProject}>Open Project…</button>
+            <button className="ghost" onClick={() => setMutationPanelOpen(true)}>History</button>
           </div>
           <div className="status">
             <span className="dot" />
@@ -113,8 +124,20 @@ export default function App() {
           onMutationCommitted={bumpMutationLog}
           onPendingChange={setPendingCount}
         />
-        <MutationPanel projectDir={projectDir} refreshKey={mutationLogVersion} onUndo={bumpMutationLog} />
       </div>
+
+      {mutationPanelOpen && (
+        <div className="mutationDrawerOverlay" onMouseDown={() => setMutationPanelOpen(false)}>
+          <div onMouseDown={(e) => e.stopPropagation()}>
+            <MutationPanel
+              projectDir={projectDir}
+              refreshKey={mutationLogVersion}
+              onUndo={bumpMutationLog}
+              onClose={() => setMutationPanelOpen(false)}
+            />
+          </div>
+        </div>
+      )}
 
       {newProjectModalOpen && (
         <div className="modalOverlay" onMouseDown={closeNewProjectModal}>

@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 
-export default function MutationPanel({ projectDir, refreshKey, onUndo }) {
+export default function MutationPanel({ projectDir, refreshKey, onUndo, onClose }) {
   const [entries, setEntries] = useState([]);
   const [undoError, setUndoError] = useState(null);
 
@@ -26,9 +26,12 @@ export default function MutationPanel({ projectDir, refreshKey, onUndo }) {
     <div className="mutationPanel">
       <div className="mutationPanelHeader">
         <span>Mutation log</span>
-        <button className="ghost" onClick={handleUndo} disabled={entries.length === 0}>
-          Undo last
-        </button>
+        <div className="headerActions">
+          <button className="ghost" onClick={handleUndo} disabled={entries.length === 0}>
+            Undo last
+          </button>
+          <button className="closeButton" onClick={onClose} aria-label="Close">×</button>
+        </div>
       </div>
 
       {!projectDir && (

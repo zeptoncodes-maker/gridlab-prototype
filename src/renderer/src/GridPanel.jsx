@@ -57,9 +57,11 @@ const WORKBOOK_ID = 'gridlab-workbook';
 
 export default function GridPanel({ projectDir, onDimsChange, onStatusChange, onMutationCommitted, onPendingChange }) {
   const containerRef = useRef(null);
+  const searchInputRef = useRef(null);
   const univerApiRef = useRef(null);
   const columnsRef = useRef([]); // index -> column name, index 0 is the header row's column 0
   const rowIdsRef = useRef([]); // sheet body row index (0-based, header excluded) -> DB row id
+  const fullDatasetColumnWidthsRef = useRef([]); // widths captured ONLY when leaving the full-dataset view (not a search result) — see the searchResultCount check in mountRowsIntoUniver. This is what Reset restores.
   const idColumnNameRef = useRef('id');
   // FIX: this used to be a boolean (suppressNextCommandRef), which only
   // correctly skips ONE re-entrant command. Both the header-revert loop and
@@ -173,7 +175,7 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectDir]);
 
-  async function loadInitialWindow() {
+  async function loadInitialWindow({ autoFitColumns = true } = {}) {
     const result = await window.gridlabAPI.grid.getRows(0, EDITABLE_WINDOW_SIZE);
     if (result.error) {
       setGridError(result.error);
@@ -183,7 +185,7 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
       showEmptyState();
       return;
     }
-    mountRowsIntoUniver(result.rows);
+    mountRowsIntoUniver(result.rows, { autoFitColumns });
   }
 
   // Nothing has ever been loaded into this project/session — a brand-new
@@ -207,7 +209,7 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     );
   }
 
-  function mountRowsIntoUniver(rows, { statusLabel } = {}) {
+  function mountRowsIntoUniver(rows, { statusLabel, autoFitColumns = true } = {}) {
     setNoDataset(false);
     if (rows.length === 0) {
       setGridError('No rows matched — nothing to load into the grid. Clear search to go back.');
@@ -276,7 +278,19 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
           name: 'Sheet1',
           cellData,
           rowCount: rows.length + 1,
-          columnCount: columns.length,
+          // FIX: this used to be exactly columns.length, so Univer only
+          // ever drew that many columns — everything to the right, out to
+          // the edge of the container, was just blank unused canvas
+          // rather than an actual spreadsheet grid. A real spreadsheet
+          // always shows a wide field of empty columns past your data, so
+          // it reads as "a spreadsheet" rather than "a bounded table."
+          // Padding this out (and giving the extras Univer's own default
+          // width, not auto-fit) fixes that without touching how real
+          // data columns behave — cells past columnsRef.current.length
+          // already fall through handleCellCommand's `if (!column)
+          // continue;` check, so typing into the padding area is
+          // harmlessly ignored rather than silently "saved" nowhere.
+          columnCount: Math.max(columns.length + 20, 26),
           // Row 0 (the header) is protected from edits the same way the
           // id column is — see handleCellCommand's bounds check below,
           // which additionally refuses row 0 regardless of what the
@@ -293,11 +307,57 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     // Without this, only the *very first* mount (page load) ever actually
     // rendered — every later call (search, Reset, Open File)
     // built a correct workbookData object and then had it thrown away.
+    //
+    // Because disposeUnit+createWorkbook fully replaces the workbook, a
+    // fresh createWorkbook has NO column-width info at all — it always
+    // starts from Univer's plain default width, regardless of whatever
+    // was showing a moment ago. So before disposing, capture the current
+    // widths here (getColumnWidth is a real, documented Facade method:
+    // https://docs.univer.ai/reference/facade/worksheet#getcolumnwidth).
+    //
+    // FIX: this used to unconditionally overwrite the remembered widths on
+    // every single mount — including a search's own mount. Since a search
+    // defaults to autoFitColumns: true (search results often have very
+    // different content shape than the full dataset), running a search
+    // would silently overwrite the "real" full-dataset widths with the
+    // search result's auto-fit widths. Then Reset — which is supposed to
+    // restore your original manual sizing — would restore THOSE instead,
+    // making it look like Reset "forgot" your resize. searchResultCount
+    // here still reflects whatever was on screen a moment ago (its setter
+    // hasn't landed in this closure yet), so this only updates the
+    // full-dataset memory when we're actually leaving the full-dataset
+    // view — never when leaving a search result.
     if (univerApiRef.current.getActiveWorkbook()) {
+      const prevSheet = univerApiRef.current.getActiveWorkbook().getActiveSheet();
+      if (searchResultCount === null) {
+        fullDatasetColumnWidthsRef.current = Array.from({ length: columns.length }, (_, c) =>
+          prevSheet.getColumnWidth(c)
+        );
+      }
       univerApiRef.current.disposeUnit(WORKBOOK_ID);
     }
 
     univerApiRef.current.createWorkbook(workbookData);
+
+    // Either auto-fit every column to its actual content (Univer's own
+    // built-in text-measurement, not a guessed character count —
+    // https://docs.univer.ai/guides/sheets/features/core/row-col
+    // #auto-resize-columns), or restore the full-dataset widths captured
+    // above. Reset passes autoFitColumns: false (see clearSearch) — it's
+    // returning to the SAME already-loaded dataset, not a fresh file, so
+    // it should preserve whatever widths were showing the last time you
+    // were actually looking at the full dataset (auto-fit or manually
+    // dragged), not whatever a search happened to auto-fit to.
+    const workbook = univerApiRef.current.getActiveWorkbook();
+    const sheet = workbook.getActiveSheet();
+    if (autoFitColumns) {
+      sheet.autoResizeColumns(0, columns.length);
+    } else if (fullDatasetColumnWidthsRef.current.length > 0) {
+      fullDatasetColumnWidthsRef.current.forEach((width, c) => {
+        if (c < columns.length) sheet.setColumnWidth(c, width);
+      });
+    }
+
     onDimsChange({ rows: rowIdsRef.current.length, cols: columns.length });
     // FIX: this used to always claim "(edits stay unsaved)" whenever no
     // project was open — no longer true. Since demo data was removed, the
@@ -392,11 +452,36 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     const ok = window.confirm(
       `You have ${count} unsaved change${count === 1 ? '' : 's'}. Discard ${count === 1 ? 'it' : 'them'} and continue?`
     );
+    // FIX: window.confirm() in Electron is a real native OS-level modal
+    // (confirmed by the screenshot — that's a plain Windows dialog box,
+    // not something our app rendered), and closing a native dialog
+    // doesn't always correctly restore keyboard focus to the page
+    // afterward — a known Electron/Chromium focus-handoff quirk. This
+    // manifested as the search <input> silently refusing to accept
+    // keystrokes after clicking OK/Cancel here, until the whole window
+    // was blurred and refocused (e.g. alt-tabbing away and back), which
+    // forces Windows to redo that handoff. Doing that same blur+refocus
+    // programmatically means the person never has to do it manually.
+    forceRefocusWindow();
     if (ok) {
       pendingEditsRef.current = new Map();
       setPendingCount(0);
     }
     return ok;
+  }
+
+  function forceRefocusWindow() {
+    // FIX (attempt 2): window.focus() + document.body.focus() didn't
+    // actually resolve this — body isn't a normally-focusable element in
+    // the first place, so that call was likely a silent no-op. Going more
+    // direct: explicitly focus the exact input that was reported stuck,
+    // via a real ref, which is the standard reliable way to force DOM
+    // focus onto a specific element in React, rather than hoping a vaguer
+    // window-level focus call trickles down correctly.
+    setTimeout(() => {
+      window.focus();
+      searchInputRef.current?.focus();
+    }, 100);
   }
 
   // --- Save --------------------------------------------------------------
@@ -442,6 +527,18 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
   // view anymore). ------------------------------------------------------
   async function runSearch() {
     setSearchError(null);
+    // FIX: an empty search box used to still hit the backend — DuckDB's
+    // WHERE clause sanitizer treats an empty string as "match everything"
+    // (WHERE 1=1), so Run with nothing typed silently ran a REAL query,
+    // capped at 200 rows, and fully remounted the grid (its own fresh
+    // auto-fit included) — even though nothing was actually searched for.
+    // That's what caused "Showing 200 search result(s)..." and the grid's
+    // formatting visibly resetting on an empty Run. There's nothing to
+    // search for an empty box, so just say that and stop here.
+    if (!searchValue.trim()) {
+      setSearchError('Type something to search for first — e.g. department = Engineering.');
+      return;
+    }
     if (noDataset) {
       setSearchError('No dataset loaded — open a file first, then search.');
       return;
@@ -461,7 +558,12 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     setSearchValue('');
     setSearchError(null);
     setSearchResultCount(null);
-    await loadInitialWindow();
+    // autoFitColumns: false — per product decision, Reset restores the
+    // full dataset but should NOT touch column widths. It's the same
+    // dataset that was already loaded, not a fresh file, so whatever
+    // widths are currently set (auto-fit from the last real load, or
+    // manually resized since) should stick around exactly as they are.
+    await loadInitialWindow({ autoFitColumns: false });
   }
 
   const handleOpenCsv = useCallback(async () => {
@@ -483,6 +585,7 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
         <span className="prompt">›</span>
         <input
           id="searchInput"
+          ref={searchInputRef}
           type="text"
           placeholder="department = Engineering"
           value={searchValue}

@@ -1,18 +1,22 @@
 :root {
-  --paper: #101216;
-  --surface: #191C21;
-  --stripe: #1D2127;
-  --header-bg: #15171C;
-  --ink: #F3F5F7;
-  --ink-soft: #A7ADB6;
-  --ink-faint: #676E79;
-  --line: #272B32;
-  --line-soft: #20242A;
-  --accent: #2DD4BF;
-  --accent-dark: #12A594;
-  --accent-ink: #06201C;
-  --accent-soft: rgba(45, 212, 191, 0.11);
-  --danger: #F87171;
+  /* Light, native-spreadsheet palette — replaces the old dark "app shell"
+     theme. Goal: the page should read as ONE spreadsheet app (like Excel
+     or Sheets), not a dark dashboard with a spreadsheet embedded in a
+     card. Univer's own toolbar/grid chrome is light by default, so this
+     palette is built to sit flush against that rather than clash with it. */
+  --paper: #FFFFFF;
+  --toolbar-bg: #F8F9FA;
+  --ink: #1F2328;
+  --ink-soft: #5F6368;
+  --ink-faint: #80868B;
+  --line: #E1E3E6;
+  --line-soft: #EDEEF0;
+  --accent: #0F9D8A;
+  --accent-hover: #0C8577;
+  --accent-soft: rgba(15, 157, 138, 0.08);
+  --accent-border: rgba(15, 157, 138, 0.28);
+  --danger: #D93025;
+  --danger-soft: rgba(217, 48, 37, 0.08);
   --mono: 'SF Mono', 'Cascadia Code', 'Roboto Mono', Consolas, monospace;
   --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
 }
@@ -27,164 +31,170 @@ html, body, #root {
 
 body {
   background: var(--paper);
-  background-image: radial-gradient(ellipse 900px 500px at 15% -10%, rgba(45, 212, 191, 0.05), transparent);
   color: var(--ink);
   font-family: var(--sans);
   -webkit-font-smoothing: antialiased;
 }
 
+/* --- App shell: full-bleed, no padding/margin/max-width — the grid IS
+   the app surface, not something floating inside a bordered card. ------ */
 .shell {
   height: 100%;
+  width: 100%;
   display: flex;
   flex-direction: column;
-  padding: 36px 44px;
-  max-width: 1520px;
-  margin: 0 auto;
 }
 
+/* App-level strip: project actions + doc identity. Deliberately slim,
+   like a spreadsheet app's title bar rather than a branded dashboard
+   header. */
 .topbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 22px;
+  padding: 7px 16px;
+  background: var(--toolbar-bg);
+  border-bottom: 1px solid var(--line);
   flex-shrink: 0;
 }
 
-.brand { display: flex; align-items: center; gap: 14px; }
-.brand h1 { font-size: 23px; font-weight: 800; letter-spacing: -0.02em; margin: 0; }
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand h1 { font-size: 14.5px; font-weight: 700; letter-spacing: -0.01em; margin: 0; color: var(--ink); }
 .brand .dims {
-  display: flex; align-items: center; gap: 5px;
-  font-family: var(--mono); font-size: 12px; color: var(--accent);
-  background: var(--accent-soft); border: 1px solid rgba(45, 212, 191, 0.2);
-  padding: 5px 11px; border-radius: 100px;
+  display: flex; align-items: center; gap: 4px;
+  font-family: var(--mono); font-size: 11px; color: var(--accent);
+  background: var(--accent-soft); border: 1px solid var(--accent-border);
+  padding: 3px 9px; border-radius: 100px;
 }
 .brand .dims .x { color: var(--ink-faint); }
 
-.topbar-right { display: flex; align-items: center; gap: 20px; }
-.source-actions { display: flex; gap: 8px; }
-.status { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 12.5px; color: var(--ink-soft); }
+.topbar-right { display: flex; align-items: center; gap: 14px; }
+.source-actions { display: flex; gap: 6px; }
+.status { display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-soft); }
 .dot {
-  width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
-  box-shadow: 0 0 0 4px var(--accent-soft); animation: pulse 1.8s ease-in-out infinite;
+  width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft); animation: pulse 1.8s ease-in-out infinite;
 }
-@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
+/* Single-column now — the Mutation Log is a toggleable drawer, not a
+   persistent sidebar, so the grid gets the full remaining width. */
 .workarea {
   flex: 1;
   min-height: 0;
-  display: grid;
-  grid-template-columns: 1fr 300px;
-  gap: 18px;
-}
-
-.card {
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  box-shadow: 0 1px 2px rgba(0,0,0,0.25), 0 24px 60px -20px rgba(0,0,0,0.6);
-  overflow: hidden;
   display: flex;
   flex-direction: column;
-  min-height: 0;
 }
 
+/* GridPanel's root. No card treatment (no border/radius/shadow) — it
+   fills all remaining space flush against the page. */
+.card {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--paper);
+}
+
+/* GridPanel's own slim toolbar: search + Run/Reset/Save/Open File. Sits
+   directly above Univer's own (already-light) toolbar, so the two read
+   as one continuous native toolbar area rather than two mismatched
+   themes stacked on each other. */
 .console {
-  display: flex; align-items: center; gap: 14px;
-  padding: 18px 24px; border-bottom: 1px solid var(--line); background: var(--header-bg);
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 16px; border-bottom: 1px solid var(--line); background: var(--toolbar-bg);
   flex-shrink: 0; flex-wrap: wrap;
 }
-.prompt { font-family: var(--mono); font-size: 16px; color: var(--accent); font-weight: 700; }
-#searchInput { flex: 1; min-width: 180px; border: none; background: transparent; font-family: var(--mono); font-size: 15px; color: var(--ink); padding: 8px 0; }
-#searchInput:focus { outline: none; }
+.prompt { font-family: var(--mono); font-size: 14px; color: var(--accent); font-weight: 700; }
+#searchInput {
+  flex: 1; min-width: 180px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--paper); font-family: var(--mono); font-size: 12.5px; color: var(--ink);
+  padding: 6px 10px;
+}
+#searchInput:focus { outline: none; border-color: var(--accent); }
 #searchInput::placeholder { color: var(--ink-faint); }
 
 button {
-  padding: 10px 20px; border: 1px solid var(--accent-dark); background: var(--accent-dark);
-  color: var(--accent-ink); border-radius: 8px; font-size: 13.5px; font-weight: 700;
+  padding: 7px 14px; border: 1px solid var(--accent); background: var(--accent);
+  color: #fff; border-radius: 6px; font-size: 12.5px; font-weight: 600;
   cursor: pointer; font-family: var(--sans); transition: background 0.15s ease, transform 0.1s ease;
   white-space: nowrap;
 }
-button:hover { background: var(--accent); }
+button:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 button:active { transform: scale(0.97); }
 button:disabled { opacity: 0.4; cursor: not-allowed; }
 button.ghost { background: transparent; color: var(--ink-soft); border-color: var(--line); }
-button.ghost:hover { background: var(--paper); color: var(--ink); }
+button.ghost:hover { background: var(--line-soft); color: var(--ink); }
 
-.univerContainer { flex: 1; min-height: 0; background: var(--surface); }
-
-.scrollBox { flex: 1; min-height: 0; overflow-y: auto; background: var(--surface); }
-table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 13.5px; }
-thead th {
-  position: sticky; top: 0; background: var(--header-bg); text-align: left; padding: 13px 24px;
-  font-family: var(--sans); font-weight: 700; font-size: 11px; text-transform: uppercase;
-  letter-spacing: 0.07em; color: var(--ink-faint); border-bottom: 1px solid var(--line);
-}
-tbody td { padding: 11px 24px; border-bottom: 1px solid var(--line-soft); color: var(--ink); }
-tbody tr:nth-child(even) td { background: var(--stripe); }
+/* The actual Univer canvas mount point — takes every remaining pixel. */
+.univerContainer { flex: 1; min-height: 0; background: var(--paper); }
 
 .errorBanner {
-  padding: 10px 24px; background: rgba(248, 113, 113, 0.1); color: var(--danger);
-  font-family: var(--mono); font-size: 13px; border-bottom: 1px solid var(--line);
+  padding: 8px 16px; background: var(--danger-soft); color: var(--danger);
+  font-family: var(--mono); font-size: 12.5px; border-bottom: 1px solid var(--line);
 }
-
 .searchResultsNotice {
-  padding: 10px 24px; background: var(--accent-soft); color: var(--accent);
-  font-size: 12.5px; border-bottom: 1px solid var(--line);
+  padding: 8px 16px; background: var(--accent-soft); color: var(--accent);
+  font-size: 12px; border-bottom: 1px solid var(--line);
 }
-
 .emptyStateNotice {
-  padding: 10px 24px; background: var(--paper); color: var(--ink-faint);
-  font-size: 12.5px; border-bottom: 1px solid var(--line);
+  padding: 8px 16px; background: var(--toolbar-bg); color: var(--ink-faint);
+  font-size: 12px; border-bottom: 1px solid var(--line);
 }
-
 .unsavedNotice {
-  padding: 10px 24px; background: rgba(248, 113, 113, 0.08); color: var(--danger);
-  font-size: 12.5px; border-bottom: 1px solid var(--line);
+  padding: 8px 16px; background: var(--danger-soft); color: var(--danger);
+  font-size: 12px; border-bottom: 1px solid var(--line);
 }
 
+/* --- Mutation Log: now a toggleable slide-in drawer (opened via the
+   "History" button in the top strip) rather than a permanent dark
+   sidebar — this is what actually frees up the grid to use the full
+   screen width by default. -------------------------------------------- */
+.mutationDrawerOverlay {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.15); z-index: 100;
+}
 .mutationPanel {
-  background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
-  display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+  position: fixed; top: 0; right: 0; height: 100%; width: 340px; max-width: 90vw;
+  background: var(--paper); border-left: 1px solid var(--line);
+  box-shadow: -12px 0 28px rgba(0, 0, 0, 0.10);
+  display: flex; flex-direction: column; z-index: 101;
 }
 .mutationPanelHeader {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 16px 18px; border-bottom: 1px solid var(--line); background: var(--header-bg);
-  font-size: 13px; font-weight: 700; color: var(--ink-soft); flex-shrink: 0;
+  padding: 13px 16px; border-bottom: 1px solid var(--line); background: var(--toolbar-bg);
+  font-size: 13px; font-weight: 700; color: var(--ink); flex-shrink: 0;
 }
-.mutationPanelEmpty { padding: 16px 18px; font-size: 12.5px; color: var(--ink-faint); line-height: 1.5; }
+.mutationPanelHeader .headerActions { display: flex; align-items: center; gap: 8px; }
+.closeButton {
+  background: transparent; border: none; color: var(--ink-soft);
+  font-size: 16px; line-height: 1; padding: 4px 8px; border-radius: 6px;
+}
+.closeButton:hover { background: var(--line-soft); color: var(--ink); }
+.mutationPanelEmpty { padding: 16px; font-size: 12.5px; color: var(--ink-faint); line-height: 1.5; }
 .mutationList { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
-.mutationEntry { padding: 12px 18px; border-bottom: 1px solid var(--line-soft); }
+.mutationEntry { padding: 12px 16px; border-bottom: 1px solid var(--line-soft); }
 .mutationEntryIntent { font-size: 12.5px; color: var(--ink); margin-bottom: 3px; }
 .mutationEntryDiff { font-family: var(--mono); font-size: 11.5px; color: var(--accent); margin-bottom: 3px; word-break: break-word; }
 .mutationEntryMeta { font-size: 10.5px; color: var(--ink-faint); text-transform: uppercase; letter-spacing: 0.05em; }
 
+/* --- New Project modal ------------------------------------------------ */
 .modalOverlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.55);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 100;
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.25);
+  display: flex; align-items: center; justify-content: center; z-index: 200;
 }
-
 .modalDialog {
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  box-shadow: 0 1px 2px rgba(0,0,0,0.25), 0 24px 60px -20px rgba(0,0,0,0.6);
-  padding: 24px;
-  width: 340px;
+  background: var(--paper); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.15); padding: 22px; width: 340px;
   max-width: calc(100vw - 48px);
 }
-.modalDialog h2 { margin: 0 0 16px; font-size: 16px; font-weight: 800; letter-spacing: -0.01em; }
+.modalDialog h2 { margin: 0 0 14px; font-size: 15px; font-weight: 700; color: var(--ink); }
 .modalDialog label {
   display: block; font-size: 11px; font-weight: 700; text-transform: uppercase;
-  letter-spacing: 0.07em; color: var(--ink-faint); margin-bottom: 8px;
+  letter-spacing: 0.06em; color: var(--ink-faint); margin-bottom: 6px;
 }
 .modalDialog input[type="text"] {
   width: 100%; border: 1px solid var(--line); background: var(--paper); color: var(--ink);
-  font-family: var(--mono); font-size: 14px; padding: 10px 12px; border-radius: 8px;
+  font-family: var(--mono); font-size: 13px; padding: 8px 10px; border-radius: 6px;
 }
-.modalDialog input[type="text"]:focus { outline: none; border-color: var(--accent-dark); }
-.modalActions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+.modalDialog input[type="text"]:focus { outline: none; border-color: var(--accent); }
+.modalActions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
