@@ -8,6 +8,7 @@ export const SCHEMA_VERSION = 1;
 //   ├── manifest.json      — schema version, dataset reference, settings
 //   ├── workbook.json       — sheet/window state (see note below)
 //   ├── mutations.ndjson    — append-only log: undo, audit, time travel
+//   ├── formats.json        — cell formatting (color, bold, etc.), keyed by row id + column
 //   └── local.duckdb        — project-owned DuckDB file
 //
 // SIMPLIFICATION vs. the full spec: workbook.json here stores which rows
@@ -18,6 +19,25 @@ export const SCHEMA_VERSION = 1;
 // once the grid itself is stable, but isn't attempted here. Row *data*
 // still round-trips correctly because it lives in local.duckdb, not in
 // workbook.json — only view/layout state would be lost on reopen today.
+//
+// formats.json is a deliberately separate, simpler mechanism from a full
+// Univer snapshot — it's the spec's setFormat mutation type (§3.4), but
+// implemented as its own flat key→style map rather than threaded through
+// the value-edit mutation pipeline in mutations.js (which is entirely
+// DuckDB-column-shaped and has no notion of style at all). This means
+// format changes don't appear in the Mutation Log or support undo the way
+// value edits do — a deliberate scope trim, same spirit as mutations.js's
+// own SCOPE NOTE about not implementing all six mutation ops yet. Keys are
+// `${rowId}:${column}` — addressed by STABLE row identity, not sheet
+// position, so formatting survives search/reset (which mount a different
+// subset/order of rows) and reopening the project.
+//
+// This file lives at manifest.json's side ONLY when a project is open. A
+// CSV opened with no project gets its own sidecar file instead (e.g.
+// data.csv.formats.json, next to data.csv) — see getFormatsFilePath() in
+// main/index.js, which decides which of the two applies. This mirrors how
+// value edits already persist without a project (straight back into the
+// CSV, via exportToCsv in duckdb.js) — formatting gets the same treatment.
 
 export async function createProject(dirPath, { name }) {
   await fs.mkdir(dirPath, { recursive: true });
@@ -32,6 +52,7 @@ export async function createProject(dirPath, { name }) {
   await writeJson(path.join(dirPath, 'manifest.json'), manifest);
   await writeJson(path.join(dirPath, 'workbook.json'), { loadedRowWindow: { offset: 0, limit: 0 } });
   await fs.writeFile(path.join(dirPath, 'mutations.ndjson'), '', 'utf8');
+  await writeJson(path.join(dirPath, 'formats.json'), {});
 
   return { dirPath, manifest };
 }
@@ -113,6 +134,47 @@ export async function truncateMutationLog(dirPath, keepCount) {
 
 export function localDuckdbPath(dirPath) {
   return path.join(dirPath, 'local.duckdb');
+}
+
+// --- Cell formatting (setFormat, per spec §3.4) -------------------------
+// A flat { "rowId:column": IStyleData } map — see the file-map comment at
+// the top of this file for why this is separate from mutations.ndjson.
+//
+// These take a fully-resolved file path directly, not a project
+// directory — the caller (main/index.js) decides WHERE that lives: inside
+// the open project as formats.json if one's open, or as a sidecar file
+// next to the CSV itself (e.g. data.csv.formats.json) if not. That mirrors
+// how value edits already work without a project (exportToCsv in
+// duckdb.js writes straight back to the CSV regardless of project state)
+// — formatting now gets the same treatment via its own sidecar file.
+
+export async function readFormatsFile(filePath) {
+  try {
+    const raw = await fs.readFile(filePath, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    // Missing/corrupt file isn't fatal — just means no stored formatting
+    // yet (a fresh CSV, or a project created before this feature existed).
+    return {};
+  }
+}
+
+// Merges a batch of { key, style } entries into the formats file in one
+// read+write, rather than one file operation per cell — matters once
+// someone selects a range and colors many cells in a single Save. A
+// style of null/undefined DELETES that key (clearing formatting), since
+// an empty/default style isn't meaningfully different from "no entry."
+export async function updateFormatsFile(filePath, entries) {
+  const current = await readFormatsFile(filePath);
+  for (const { key, style } of entries) {
+    if (style === null || style === undefined) {
+      delete current[key];
+    } else {
+      current[key] = style;
+    }
+  }
+  await writeJson(filePath, current);
+  return current;
 }
 
 async function writeJson(filePath, data) {

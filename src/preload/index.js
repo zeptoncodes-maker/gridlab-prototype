@@ -18,4 +18,11 @@ contextBridge.exposeInMainWorld('gridlabAPI', {
       ipcRenderer.invoke('mutations:editCell', { rowId, column, newValue }),
     undo: () => ipcRenderer.invoke('mutations:undo'),
   },
+  app: {
+    confirmDiscard: (message) => ipcRenderer.invoke('app:confirmDiscard', message),
+  },
+  format: {
+    getAll: () => ipcRenderer.invoke('format:getAll'),
+    commit: (entries) => ipcRenderer.invoke('format:commit', entries),
+  },
 });

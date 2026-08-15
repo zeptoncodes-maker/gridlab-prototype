@@ -79,13 +79,30 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
   // snapshotted at mount time — used as the "before" side of a pending
   // edit's diff, and to revert a specific cell if Save fails for it.
   const originalValuesRef = useRef(new Map());
+  // Cell FORMATTING (color, bold, etc.) — a separate, simpler track from
+  // value edits above, since it's saved to its own formats.json rather
+  // than DuckDB/the CSV (see project.js). Keyed by "rowId:column" (STABLE
+  // identity), not sheet position — unlike values, formats don't need an
+  // "original" baseline captured at mount time, since they're reapplied
+  // fresh from formatsRef on every single mount regardless of which rows
+  // happen to be showing (search, reset, whatever), so there's nothing
+  // position-dependent to track.
+  const formatsRef = useRef({}); // the last-known-persisted formats for the open project, refreshed on every mount
+  const pendingFormatsRef = useRef(new Map()); // "rowId:column" -> { rowId, column, newStyle } staged but not yet saved
 
   const [searchValue, setSearchValue] = useState('');
   const [searchResultCount, setSearchResultCount] = useState(null); // null = not searching; number = rows from the last search, currently mounted into the grid
   const [searchError, setSearchError] = useState(null);
   const [gridError, setGridError] = useState(null);
   const [noDataset, setNoDataset] = useState(false); // true when nothing has been loaded yet (new/empty project, or fresh app launch)
-  const [pendingCount, setPendingCount] = useState(0); // number of unsaved edits currently staged
+  const [pendingCount, setPendingCount] = useState(0); // number of unsaved edits currently staged (value edits + format edits combined)
+
+  // Every place that changes either pending map calls this instead of
+  // setPendingCount directly, so the displayed count/Save button always
+  // reflects both tracks together.
+  function recalculatePendingCount() {
+    setPendingCount(pendingEditsRef.current.size + pendingFormatsRef.current.size);
+  }
 
   useEffect(() => {
     onPendingChange?.(pendingCount);
@@ -176,11 +193,15 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
   }, [projectDir]);
 
   async function loadInitialWindow({ autoFitColumns = true } = {}) {
-    const result = await window.gridlabAPI.grid.getRows(0, EDITABLE_WINDOW_SIZE);
+    const [result, formatResult] = await Promise.all([
+      window.gridlabAPI.grid.getRows(0, EDITABLE_WINDOW_SIZE),
+      window.gridlabAPI.format.getAll(),
+    ]);
     if (result.error) {
       setGridError(result.error);
       return;
     }
+    formatsRef.current = formatResult?.formats || {};
     if (!result.datasetLoaded) {
       showEmptyState();
       return;
@@ -197,6 +218,7 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     setGridError(null);
     setSearchResultCount(null);
     pendingEditsRef.current = new Map();
+    pendingFormatsRef.current = new Map();
     setPendingCount(0);
     if (univerApiRef.current?.getActiveWorkbook()) {
       univerApiRef.current.disposeUnit(WORKBOOK_ID);
@@ -246,8 +268,18 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     });
     rows.forEach((row, r) => {
       cellData[r + 1] = {};
+      const rowId = row[idColumnNameRef.current];
       columns.forEach((col, c) => {
-        cellData[r + 1][c] = { v: row[col] };
+        const cell = { v: row[col] };
+        // Reapply any stored formatting for this cell — keyed by the row's
+        // stable identity (rowId), not sheet position, so it correctly
+        // survives search/reset mounting a different subset/order of rows.
+        // See project.js for why this is a separate mechanism from values.
+        const storedStyle = formatsRef.current[`${rowId}:${col}`];
+        if (storedStyle !== undefined) {
+          cell.s = storedStyle;
+        }
+        cellData[r + 1][c] = cell;
       });
     });
 
@@ -267,6 +299,7 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     });
     originalValuesRef.current = freshOriginalValues;
     pendingEditsRef.current = new Map();
+    pendingFormatsRef.current = new Map();
     setPendingCount(0);
 
     const workbookData = {
@@ -291,6 +324,22 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
           // continue;` check, so typing into the padding area is
           // harmlessly ignored rather than silently "saved" nowhere.
           columnCount: Math.max(columns.length + 20, 26),
+          // FIX: we never used to include columnData/rowData at all — just
+          // cellData, rowCount, columnCount. Confirmed via a real thrown
+          // error (not a guess this time): Univer's own internal
+          // AutoWidthController.getUndoRedoParamsOfColWidth (called from
+          // autoResizeColumns, used for the column-auto-fit feature)
+          // expects a real columnData structure to already exist so it
+          // can record "before" widths for undo/redo — with it entirely
+          // absent (undefined, not even an empty object), it crashed
+          // trying to call a method on undefined. Uncaught errors inside
+          // Univer's own CommandService mid-execution can plausibly leave
+          // its internal state broken in ways that show up as unrelated
+          // symptoms elsewhere (e.g. keyboard input misbehaving) — this is
+          // likely the real root cause of the "search box stops working"
+          // report, not a window-focus issue at all.
+          columnData: {},
+          rowData: {},
           // Row 0 (the header) is protected from edits the same way the
           // id column is — see handleCellCommand's bounds check below,
           // which additionally refuses row 0 regardless of what the
@@ -350,12 +399,24 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     // dragged), not whatever a search happened to auto-fit to.
     const workbook = univerApiRef.current.getActiveWorkbook();
     const sheet = workbook.getActiveSheet();
-    if (autoFitColumns) {
-      sheet.autoResizeColumns(0, columns.length);
-    } else if (fullDatasetColumnWidthsRef.current.length > 0) {
-      fullDatasetColumnWidthsRef.current.forEach((width, c) => {
-        if (c < columns.length) sheet.setColumnWidth(c, width);
-      });
+    // Defensive: we just directly observed autoResizeColumns throw an
+    // uncaught error from inside Univer's own internal code (see the
+    // columnData/rowData comment above). An uncaught error here — inside
+    // Univer's CommandService execution chain — can plausibly leave its
+    // internal state broken in ways that surface as unrelated symptoms
+    // elsewhere. Catching it means a Univer-internal quirk degrades
+    // gracefully (you just don't get auto-fit/restored widths that one
+    // time) instead of potentially destabilizing the whole grid.
+    try {
+      if (autoFitColumns) {
+        sheet.autoResizeColumns(0, columns.length);
+      } else if (fullDatasetColumnWidthsRef.current.length > 0) {
+        fullDatasetColumnWidthsRef.current.forEach((width, c) => {
+          if (c < columns.length) sheet.setColumnWidth(c, width);
+        });
+      }
+    } catch (err) {
+      console.error('Column width operation failed:', err);
     }
 
     onDimsChange({ rows: rowIdsRef.current.length, cols: columns.length });
@@ -414,8 +475,36 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
         const column = columnsRef.current[sheetCol];
         if (!column) continue;
 
-        const newValue = cellValue[rowKey][colKey]?.v;
-        stagePendingEdit(sheetRow, sheetCol, rowId, column, newValue);
+        const cellDescriptor = cellValue[rowKey][colKey];
+        const newValue = cellDescriptor?.v;
+        const newStyle = cellDescriptor?.s;
+
+        // TEMPORARY DIAGNOSTIC — remove once format persistence is
+        // confirmed working end-to-end. Dumps the full cell descriptor
+        // whenever there's no value (a formatting-only change), so we can
+        // confirm the real shape of `.s` in this exact Univer version
+        // (docs say it's either a style-id string or an inline IStyleData
+        // object) before fully relying on it.
+        if (newValue === undefined) {
+          console.log('[diagnostic] style-only cell descriptor:', JSON.stringify(cellDescriptor));
+        }
+
+        // FIX: a pure formatting change (fill color, bold, etc.) fires
+        // this SAME command id as a real value edit, but its cell
+        // descriptor has no `.v` key at all — so newValue comes out as
+        // undefined, not null/''. Staging that as if it were a real edit
+        // meant Save would try to write the literal 4-character string
+        // "undefined" into the database (String(undefined) ===
+        // 'undefined'), which then failed loudly on any numeric column
+        // ("Could not convert string 'undefined' to INT64"). A genuinely
+        // cleared cell still carries a real value (null or ''), so this
+        // doesn't block that — only a true style-only change skips here.
+        if (newValue !== undefined) {
+          stagePendingEdit(sheetRow, sheetCol, rowId, column, newValue);
+        }
+        if (newStyle !== undefined) {
+          stagePendingFormat(rowId, column, newStyle);
+        }
       }
     }
   }
@@ -428,7 +517,22 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     // edit — so the eventual diff/undo record reflects true before/after.
     const originalValue = existing ? existing.originalValue : originalValuesRef.current.get(key);
     pendingEditsRef.current.set(key, { sheetRow, sheetCol, rowId, column, newValue, originalValue });
-    setPendingCount(pendingEditsRef.current.size);
+    recalculatePendingCount();
+  }
+
+  // Formatting (setFormat, per spec §3.4) — its own simpler track from
+  // value edits, saved to formats.json (project open) or a CSV sidecar
+  // file (no project — see getFormatsFilePath in main/index.js) rather
+  // than DuckDB/the CSV itself. Keyed by stable rowId:column, not sheet
+  // position, since it needs to survive search/reset remounting a
+  // different subset of rows. Stages regardless of project state, same as
+  // value edits — the backend decides at Save time whether there's
+  // actually somewhere to persist it (only true failure: no project AND
+  // no CSV ever loaded).
+  function stagePendingFormat(rowId, column, newStyle) {
+    const key = `${rowId}:${column}`;
+    pendingFormatsRef.current.set(key, { rowId, column, newStyle });
+    recalculatePendingCount();
   }
 
   function revertHeaderEdit() {
@@ -446,61 +550,55 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
   // the pending state and returns true if the person confirms (or there
   // was nothing pending); returns false if they cancel, so the caller
   // should abort whatever it was about to do.
-  function confirmDiscardPendingEdits() {
-    if (pendingEditsRef.current.size === 0) return true;
-    const count = pendingEditsRef.current.size;
-    const ok = window.confirm(
+  //
+  // FIX: this used to use window.confirm() — a raw browser API that
+  // doesn't properly participate in Electron's window/focus lifecycle.
+  // Confirmed directly via the console: after clicking OK/Cancel on a
+  // window.confirm() dialog, document.hasFocus() in the renderer still
+  // returned false — the window never reclaimed real OS-level keyboard
+  // focus, which is what silently blocked the search input from taking
+  // keystrokes afterward. Two rounds of manually forcing focus back
+  // (window.focus()/element.focus(), then a real main-process
+  // BrowserWindow.focus() call) both failed to fix this. The actual fix
+  // is using Electron's OWN dialog API (dialog.showMessageBox, called via
+  // IPC — see app:confirmDiscard in main/index.js) instead of the raw
+  // browser one: it's a proper modal child of the BrowserWindow, so it
+  // correctly hands focus back on its own. This mirrors window.prompt()
+  // being unavailable in Electron entirely, fixed earlier the same way —
+  // raw browser dialogs just aren't reliable in this environment.
+  async function confirmDiscardPendingEdits() {
+    const count = pendingEditsRef.current.size + pendingFormatsRef.current.size;
+    if (count === 0) return true;
+    const ok = await window.gridlabAPI.app.confirmDiscard(
       `You have ${count} unsaved change${count === 1 ? '' : 's'}. Discard ${count === 1 ? 'it' : 'them'} and continue?`
     );
-    // FIX: window.confirm() in Electron is a real native OS-level modal
-    // (confirmed by the screenshot — that's a plain Windows dialog box,
-    // not something our app rendered), and closing a native dialog
-    // doesn't always correctly restore keyboard focus to the page
-    // afterward — a known Electron/Chromium focus-handoff quirk. This
-    // manifested as the search <input> silently refusing to accept
-    // keystrokes after clicking OK/Cancel here, until the whole window
-    // was blurred and refocused (e.g. alt-tabbing away and back), which
-    // forces Windows to redo that handoff. Doing that same blur+refocus
-    // programmatically means the person never has to do it manually.
-    forceRefocusWindow();
     if (ok) {
       pendingEditsRef.current = new Map();
+      pendingFormatsRef.current = new Map();
       setPendingCount(0);
     }
     return ok;
   }
 
-  function forceRefocusWindow() {
-    // FIX (attempt 2): window.focus() + document.body.focus() didn't
-    // actually resolve this — body isn't a normally-focusable element in
-    // the first place, so that call was likely a silent no-op. Going more
-    // direct: explicitly focus the exact input that was reported stuck,
-    // via a real ref, which is the standard reliable way to force DOM
-    // focus onto a specific element in React, rather than hoping a vaguer
-    // window-level focus call trickles down correctly.
-    setTimeout(() => {
-      window.focus();
-      searchInputRef.current?.focus();
-    }, 100);
-  }
-
   // --- Save --------------------------------------------------------------
-  // The only place that actually writes anything to DuckDB (and, via the
-  // main-process commit pipeline, the CSV file) now. Processes every
-  // staged edit sequentially; a failure on one cell reverts just that
-  // cell back to its true persisted value (no DB round-trip needed — we
-  // already captured it in originalValue when staging) and keeps going,
-  // rather than losing every other pending edit over one bad cell.
+  // The only place that actually writes anything to DuckDB/the CSV (value
+  // edits) or formats.json (formatting) now. Processes every staged value
+  // edit sequentially; a failure on one cell reverts just that cell back
+  // to its true persisted value (no DB round-trip needed — we already
+  // captured it in originalValue when staging) and keeps going, rather
+  // than losing every other pending edit over one bad cell. Format edits
+  // commit as a single batched call, since formats.json is just one file.
   async function handleSave() {
-    const entries = Array.from(pendingEditsRef.current.values());
-    if (entries.length === 0) return;
+    const valueEntries = Array.from(pendingEditsRef.current.values());
+    const formatEntries = Array.from(pendingFormatsRef.current.values());
+    if (valueEntries.length === 0 && formatEntries.length === 0) return;
     setGridError(null);
 
     const workbook = univerApiRef.current.getActiveWorkbook();
     const sheet = workbook.getActiveSheet();
     const failures = [];
 
-    for (const edit of entries) {
+    for (const edit of valueEntries) {
       const result = await window.gridlabAPI.mutations.editCell(edit.rowId, edit.column, edit.newValue);
       if (!result.ok) {
         failures.push({ ...edit, error: result.error });
@@ -510,13 +608,35 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
         onMutationCommitted();
       }
     }
-
     pendingEditsRef.current = new Map();
-    setPendingCount(0);
+
+    if (formatEntries.length > 0) {
+      const result = await window.gridlabAPI.format.commit(
+        formatEntries.map(({ rowId, column, newStyle }) => ({ key: `${rowId}:${column}`, style: newStyle }))
+      );
+      if (result.ok) {
+        // Mirror the committed formats into our in-memory copy right away
+        // — otherwise the very next mount, before a fresh format.getAll()
+        // round-trip, would briefly show them unstyled again.
+        formatEntries.forEach(({ rowId, column, newStyle }) => {
+          formatsRef.current[`${rowId}:${column}`] = newStyle;
+        });
+        pendingFormatsRef.current = new Map();
+      } else {
+        // No safe generic "revert to the previous style" here — unlike
+        // value edits, there's no confirmed API for restoring an
+        // arbitrary earlier IStyleData, so the pending entries stay
+        // staged (Save can be retried) rather than silently dropped.
+        failures.push({ error: result.error });
+      }
+    }
+
+    recalculatePendingCount();
 
     if (failures.length > 0) {
+      const totalAttempted = valueEntries.length + formatEntries.length;
       setGridError(
-        `${failures.length} of ${entries.length} change${entries.length === 1 ? '' : 's'} couldn't be saved: ${failures[0].error}`
+        `${failures.length} of ${totalAttempted} change${totalAttempted === 1 ? '' : 's'} couldn't be saved: ${failures[0].error}`
       );
     }
   }
@@ -543,7 +663,7 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
       setSearchError('No dataset loaded — open a file first, then search.');
       return;
     }
-    if (!confirmDiscardPendingEdits()) return;
+    if (!(await confirmDiscardPendingEdits())) return;
     const result = await window.gridlabAPI.grid.runQuery(searchValue);
     if (result.error) {
       setSearchError(result.error);
@@ -554,7 +674,7 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
   }
 
   async function clearSearch() {
-    if (!confirmDiscardPendingEdits()) return;
+    if (!(await confirmDiscardPendingEdits())) return;
     setSearchValue('');
     setSearchError(null);
     setSearchResultCount(null);
@@ -567,7 +687,7 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
   }
 
   const handleOpenCsv = useCallback(async () => {
-    if (!confirmDiscardPendingEdits()) return;
+    if (!(await confirmDiscardPendingEdits())) return;
     const result = await window.gridlabAPI.dataset.openCsvDialog();
     if (result.canceled) return;
     if (result.error) {

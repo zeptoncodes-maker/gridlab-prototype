@@ -16,5 +16,12 @@ electron.contextBridge.exposeInMainWorld("gridlabAPI", {
   mutations: {
     editCell: (rowId, column, newValue) => electron.ipcRenderer.invoke("mutations:editCell", { rowId, column, newValue }),
     undo: () => electron.ipcRenderer.invoke("mutations:undo")
+  },
+  app: {
+    confirmDiscard: (message) => electron.ipcRenderer.invoke("app:confirmDiscard", message)
+  },
+  format: {
+    getAll: () => electron.ipcRenderer.invoke("format:getAll"),
+    commit: (entries) => electron.ipcRenderer.invoke("format:commit", entries)
   }
 });

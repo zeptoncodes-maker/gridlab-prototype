@@ -31,11 +31,11 @@ export default function App() {
     }
   }, [newProjectModalOpen]);
 
-  function openNewProjectModal() {
+  async function openNewProjectModal() {
     // FIX: switching projects remounts GridPanel's whole grid from scratch,
     // which would otherwise silently throw away any unsaved (staged but
     // not yet Saved) edits with no warning at all.
-    if (pendingCount > 0 && !confirmDiscardForProjectSwitch()) return;
+    if (pendingCount > 0 && !(await confirmDiscardForProjectSwitch())) return;
     setNewProjectName('my-analysis');
     setNewProjectModalOpen(true);
   }
@@ -59,23 +59,21 @@ export default function App() {
     bumpMutationLog();
   }
 
-  function confirmDiscardForProjectSwitch() {
-    const ok = window.confirm(
+  // FIX: see the matching comment on confirmDiscardPendingEdits in
+  // GridPanel.jsx — window.confirm() doesn't properly participate in
+  // Electron's window/focus lifecycle (confirmed: document.hasFocus()
+  // stayed false afterward, even after an explicit main-process
+  // BrowserWindow.focus() call). Using Electron's own dialog.showMessageBox
+  // via IPC instead — it's a proper modal child of the BrowserWindow and
+  // correctly restores focus on its own.
+  async function confirmDiscardForProjectSwitch() {
+    return window.gridlabAPI.app.confirmDiscard(
       `You have ${pendingCount} unsaved change${pendingCount === 1 ? '' : 's'} in the current dataset. Discard ${pendingCount === 1 ? 'it' : 'them'} and continue?`
     );
-    // FIX: see the matching comment on confirmDiscardPendingEdits in
-    // GridPanel.jsx — Electron's native confirm() dialog can leave the
-    // window's keyboard focus stuck afterward, silently blocking inputs
-    // like the search box until the window is blurred and refocused.
-    setTimeout(() => {
-      window.focus();
-      document.body.focus();
-    }, 50);
-    return ok;
   }
 
   async function handleOpenProject() {
-    if (pendingCount > 0 && !confirmDiscardForProjectSwitch()) return;
+    if (pendingCount > 0 && !(await confirmDiscardForProjectSwitch())) return;
     const result = await window.gridlabAPI.project.openDialog();
     if (result.canceled) return;
     if (!result.ok) {

@@ -140,6 +140,42 @@ ipcMain.handle('project:mutationLog', async () => {
   return { entries };
 });
 
+// --- Cell formatting (setFormat, per spec §3.4) ---------------------------
+// Deliberately its own simple mechanism, separate from the mutations.js
+// pipeline — see the comment at the top of project.js for why.
+//
+// Where formatting is saved depends on what's actually open: inside the
+// project as formats.json if one is, or as a sidecar file next to the CSV
+// itself (e.g. data.csv.formats.json) if not — mirroring exactly how
+// value edits already persist without a project via exportToCsv in
+// duckdb.js. Only truly nowhere-to-save (no project AND no CSV ever
+// loaded) falls through to the error case below.
+function getFormatsFilePath() {
+  if (currentProjectDir) return path.join(currentProjectDir, 'formats.json');
+  if (session.csvSourcePath) return `${session.csvSourcePath}.formats.json`;
+  return null;
+}
+
+ipcMain.handle('format:getAll', async () => {
+  const formatsPath = getFormatsFilePath();
+  if (!formatsPath) return { formats: {} };
+  const formats = await project.readFormatsFile(formatsPath);
+  return { formats };
+});
+
+ipcMain.handle('format:commit', async (event, entries) => {
+  const formatsPath = getFormatsFilePath();
+  if (!formatsPath) {
+    return { ok: false, error: "Open a file first — there's nowhere to save formatting yet." };
+  }
+  try {
+    await project.updateFormatsFile(formatsPath, entries);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
 // --- Dataset loading (same behavior as the original prototype) -----------
 
 ipcMain.handle('dataset:openCsvDialog', async () => {
@@ -210,6 +246,26 @@ ipcMain.handle('mutations:undo', async () => {
   } catch (err) {
     return { ok: false, error: err.message };
   }
+});
+
+// --- Confirm dialog ---------------------------------------------------
+// window.confirm() is a raw Chromium/browser API — Electron passes it
+// through, but it doesn't properly participate in Electron's own
+// window/focus lifecycle. Confirmed directly: after clicking OK/Cancel on
+// a window.confirm() dialog, document.hasFocus() in the renderer still
+// returned false, silently blocking keyboard input afterward.
+// dialog.showMessageBox is Electron's OWN dialog API, built to be a
+// proper modal child of a specific BrowserWindow, so it correctly hands
+// focus back when dismissed.
+ipcMain.handle('app:confirmDiscard', async (event, message) => {
+  const result = await dialog.showMessageBox(mainWindow, {
+    type: 'question',
+    buttons: ['Discard', 'Cancel'],
+    defaultId: 1, // Cancel is the safe default — Enter shouldn't discard work
+    cancelId: 1,
+    message,
+  });
+  return result.response === 0; // true only if "Discard" was clicked
 });
 
 app.whenReady().then(createWindow);

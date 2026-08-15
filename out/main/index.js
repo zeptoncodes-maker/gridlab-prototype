@@ -228,6 +228,7 @@ async function createProject(dirPath, { name }) {
   await writeJson(path.join(dirPath, "manifest.json"), manifest);
   await writeJson(path.join(dirPath, "workbook.json"), { loadedRowWindow: { offset: 0, limit: 0 } });
   await fs.writeFile(path.join(dirPath, "mutations.ndjson"), "", "utf8");
+  await writeJson(path.join(dirPath, "formats.json"), {});
   return { dirPath, manifest };
 }
 async function openProject(dirPath) {
@@ -273,6 +274,26 @@ async function truncateMutationLog(dirPath, keepCount) {
 }
 function localDuckdbPath(dirPath) {
   return path.join(dirPath, "local.duckdb");
+}
+async function readFormatsFile(filePath) {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+async function updateFormatsFile(filePath, entries) {
+  const current = await readFormatsFile(filePath);
+  for (const { key, style } of entries) {
+    if (style === null || style === void 0) {
+      delete current[key];
+    } else {
+      current[key] = style;
+    }
+  }
+  await writeJson(filePath, current);
+  return current;
 }
 async function writeJson(filePath, data) {
   await fs.writeFile(filePath, JSON.stringify(data, null, 2), "utf8");
@@ -475,6 +496,29 @@ electron.ipcMain.handle("project:mutationLog", async () => {
   const entries = await readMutationLog(currentProjectDir);
   return { entries };
 });
+function getFormatsFilePath() {
+  if (currentProjectDir) return path.join(currentProjectDir, "formats.json");
+  if (session.csvSourcePath) return `${session.csvSourcePath}.formats.json`;
+  return null;
+}
+electron.ipcMain.handle("format:getAll", async () => {
+  const formatsPath = getFormatsFilePath();
+  if (!formatsPath) return { formats: {} };
+  const formats = await readFormatsFile(formatsPath);
+  return { formats };
+});
+electron.ipcMain.handle("format:commit", async (event, entries) => {
+  const formatsPath = getFormatsFilePath();
+  if (!formatsPath) {
+    return { ok: false, error: "Open a file first — there's nowhere to save formatting yet." };
+  }
+  try {
+    await updateFormatsFile(formatsPath, entries);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
 electron.ipcMain.handle("dataset:openCsvDialog", async () => {
   try {
     const { canceled, filePaths } = await electron.dialog.showOpenDialog(mainWindow, {
@@ -532,6 +576,17 @@ electron.ipcMain.handle("mutations:undo", async () => {
   } catch (err) {
     return { ok: false, error: err.message };
   }
+});
+electron.ipcMain.handle("app:confirmDiscard", async (event, message) => {
+  const result = await electron.dialog.showMessageBox(mainWindow, {
+    type: "question",
+    buttons: ["Discard", "Cancel"],
+    defaultId: 1,
+    // Cancel is the safe default — Enter shouldn't discard work
+    cancelId: 1,
+    message
+  });
+  return result.response === 0;
 });
 electron.app.whenReady().then(createWindow);
 electron.app.on("window-all-closed", () => {
