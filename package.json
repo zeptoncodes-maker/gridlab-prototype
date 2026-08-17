@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@duckdb/node-api": "^1.5.5-r.4",
+    "@univerjs/core": "^0.25.1",
     "@univerjs/presets": "^0.25.1",
     "@univerjs/preset-sheets-core": "^0.25.1",
     "@univerjs/sheets-ui": "^0.25.1",

@@ -110,7 +110,6 @@ export class DuckDBSession {
     this.connection = null;
     this.datasetLoaded = false;
     this.idColumn = 'id'; // which column is the addressable row key for UPDATEs; set on load
-    this.csvSourcePath = null; // the original CSV file, if this dataset came from Open File — used by exportToCsv() to keep it in sync with every edit
   }
 
   async getConnection() {
@@ -180,28 +179,27 @@ export class DuckDBSession {
     );
     this.datasetLoaded = true;
     this.idColumn = 'row_id';
-    this.csvSourcePath = filePath;
     const countResult = await conn.run(`SELECT COUNT(*) AS n FROM dataset`);
     const countRows = await countResult.getRowObjects();
     return { rowCount: Number(countRows[0].n), idColumn: this.idColumn };
   }
 
-  // NEW: keeps the ORIGINAL csv file (whatever Open File pointed at) in
-  // sync with every committed edit — called from mutations.js's
-  // commitMutation/undoLastMutation after a DB write succeeds. Writes back
-  // everything except our own internal row_id column, so the file's shape
-  // matches exactly what was originally opened — the person editing never
-  // sees row_id, so it shouldn't appear in their file either. A no-op if
-  // this session was never loaded from a CSV (e.g. dataset-less, or a
-  // project whose manifest has no CSV recorded).
-  async exportToCsv() {
-    if (!this.csvSourcePath) return;
-    const conn = await this.getConnection();
-    const escapedPath = this.csvSourcePath.replace(/'/g, "''");
-    await conn.run(
-      `COPY (SELECT * EXCLUDE (row_id) FROM dataset) TO '${escapedPath}' (HEADER, DELIMITER ',')`
-    );
-  }
+  // FIX (reverted a design mistake, confirmed against the actual spec
+  // text): this class used to also have an exportToCsv() method, called
+  // after every committed edit, that wrote the current dataset table back
+  // into the ORIGINAL source CSV file — keeping it "in sync" with every
+  // edit. That was never actually the intended design. Per the spec:
+  // "Large source data is referenced, never copied" (§3.7), and the
+  // entire "cells as a view, not storage" philosophy (§3.3) — a dataset
+  // is something DuckDB queries live, never something the app writes
+  // back into. Persisted edits belong ONLY in the project's own
+  // local.duckdb + mutations.ndjson; the original CSV is a permanent,
+  // untouched, read-only reference. If you're looking for where edits
+  // actually persist now, see applyCellEdit below — it's the only write
+  // path, and it only ever touches this session's own `dataset` table
+  // (which is local.duckdb once a project is open, :memory: otherwise —
+  // meaning edits genuinely don't persist anywhere without a project,
+  // matching the spec's project-scoped persistence model exactly).
 
   // FIX (historical): this used to be ensureDatasetLoaded(), which
   // silently loaded a built-in demo dataset any time nothing was loaded
@@ -237,7 +235,7 @@ export class DuckDBSession {
     const conn = await this.getConnection();
     assertSafeColumnName(column);
     const result = await conn.run(
-      `SELECT ${column} AS v FROM dataset WHERE ${this.idColumn} = ${Number(rowId)}`
+      `SELECT ${quoteIdentifier(column)} AS v FROM dataset WHERE ${quoteIdentifier(this.idColumn)} = ${Number(rowId)}`
     );
     const rows = await result.getRowObjects();
     if (rows.length === 0) throw new Error(`Row ${rowId} not found`);
@@ -255,7 +253,7 @@ export class DuckDBSession {
     const escaped = String(value).replace(/'/g, "''");
     const literal = value === null || value === '' ? 'NULL' : `'${escaped}'`;
     await conn.run(
-      `UPDATE dataset SET ${column} = ${literal} WHERE ${this.idColumn} = ${Number(rowId)}`
+      `UPDATE dataset SET ${quoteIdentifier(column)} = ${literal} WHERE ${quoteIdentifier(this.idColumn)} = ${Number(rowId)}`
     );
   }
 
@@ -268,13 +266,31 @@ export class DuckDBSession {
   }
 }
 
-// Column names come from our own schema introspection or from trusted
-// dataset loads, never directly from renderer input — but the mutation
-// pipeline passes a column name through IPC (Univer reports which column a
-// user edited), so it gets validated against the live schema before ever
-// reaching a SQL string. See mutations.js validateMutation().
+// FIX: this used to reject any column name containing a character outside
+// [a-zA-Z0-9_] — which meant a perfectly legitimate column like
+// "Numeric-2" (DuckDB's own auto-generated name for a duplicate CSV
+// header — read_csv_auto disambiguates collisions with a "-N" suffix)
+// could never be edited at all, always failing with "Rejected unsafe
+// column name" the moment you tried to save. The actual safety property
+// needed isn't "the name matches a narrow whitelist" — it's (1) the
+// column genuinely exists in this table's live schema, which
+// mutations.js's validateMutation already checks independently via
+// schemaColumns.has(), and (2) the SQL built from it can't be used for
+// injection, which quoteIdentifier() below now handles the standard way
+// real database tools do: quote the identifier and escape any embedded
+// quote character, rather than restricting what characters are allowed
+// at all. This only rejects something that can't possibly be a real
+// column name to begin with.
 export function assertSafeColumnName(column) {
-  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(column)) {
-    throw new Error(`Rejected unsafe column name: ${column}`);
+  if (!column || typeof column !== 'string' || column.trim() === '') {
+    throw new Error('Rejected empty column name.');
   }
+}
+
+// Safely quotes a SQL identifier (column or table name) so it can contain
+// virtually any character — hyphens, spaces, even reserved words — without
+// being confused for SQL syntax. Any embedded double-quote is escaped by
+// doubling it, matching standard ANSI SQL / DuckDB identifier quoting.
+export function quoteIdentifier(name) {
+  return `"${String(name).replace(/"/g, '""')}"`;
 }

@@ -32,12 +32,12 @@ export const SCHEMA_VERSION = 1;
 // position, so formatting survives search/reset (which mount a different
 // subset/order of rows) and reopening the project.
 //
-// This file lives at manifest.json's side ONLY when a project is open. A
-// CSV opened with no project gets its own sidecar file instead (e.g.
-// data.csv.formats.json, next to data.csv) — see getFormatsFilePath() in
-// main/index.js, which decides which of the two applies. This mirrors how
-// value edits already persist without a project (straight back into the
-// CSV, via exportToCsv in duckdb.js) — formatting gets the same treatment.
+// Formatting only persists inside a project — a bare CSV opened without
+// one stays exactly a plain, standard CSV, with nothing GridLab-specific
+// added alongside it (readFormatsFile/updateFormatsFile below take a
+// resolved path directly rather than assuming a project directory only
+// because that's convenient to call from main/index.js's getFormatsFilePath
+// — not because there's meant to be more than one caller pattern for it).
 
 export async function createProject(dirPath, { name }) {
   await fs.mkdir(dirPath, { recursive: true });
@@ -140,13 +140,11 @@ export function localDuckdbPath(dirPath) {
 // A flat { "rowId:column": IStyleData } map — see the file-map comment at
 // the top of this file for why this is separate from mutations.ndjson.
 //
-// These take a fully-resolved file path directly, not a project
-// directory — the caller (main/index.js) decides WHERE that lives: inside
-// the open project as formats.json if one's open, or as a sidecar file
-// next to the CSV itself (e.g. data.csv.formats.json) if not. That mirrors
-// how value edits already work without a project (exportToCsv in
-// duckdb.js writes straight back to the CSV regardless of project state)
-// — formatting now gets the same treatment via its own sidecar file.
+// These take a fully-resolved file path directly rather than a project
+// directory purely because that's what main/index.js's getFormatsFilePath
+// already has on hand to pass in — not because there's more than one kind
+// of caller. Formatting only ever persists inside a project's own
+// formats.json; a bare CSV stays exactly a plain, standard CSV.
 
 export async function readFormatsFile(filePath) {
   try {

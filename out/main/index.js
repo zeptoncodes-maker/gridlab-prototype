@@ -66,7 +66,6 @@ class DuckDBSession {
     this.connection = null;
     this.datasetLoaded = false;
     this.idColumn = "id";
-    this.csvSourcePath = null;
   }
   async getConnection() {
     if (!this.connection) {
@@ -129,27 +128,26 @@ class DuckDBSession {
     );
     this.datasetLoaded = true;
     this.idColumn = "row_id";
-    this.csvSourcePath = filePath;
     const countResult = await conn.run(`SELECT COUNT(*) AS n FROM dataset`);
     const countRows = await countResult.getRowObjects();
     return { rowCount: Number(countRows[0].n), idColumn: this.idColumn };
   }
-  // NEW: keeps the ORIGINAL csv file (whatever Open File pointed at) in
-  // sync with every committed edit — called from mutations.js's
-  // commitMutation/undoLastMutation after a DB write succeeds. Writes back
-  // everything except our own internal row_id column, so the file's shape
-  // matches exactly what was originally opened — the person editing never
-  // sees row_id, so it shouldn't appear in their file either. A no-op if
-  // this session was never loaded from a CSV (e.g. dataset-less, or a
-  // project whose manifest has no CSV recorded).
-  async exportToCsv() {
-    if (!this.csvSourcePath) return;
-    const conn = await this.getConnection();
-    const escapedPath = this.csvSourcePath.replace(/'/g, "''");
-    await conn.run(
-      `COPY (SELECT * EXCLUDE (row_id) FROM dataset) TO '${escapedPath}' (HEADER, DELIMITER ',')`
-    );
-  }
+  // FIX (reverted a design mistake, confirmed against the actual spec
+  // text): this class used to also have an exportToCsv() method, called
+  // after every committed edit, that wrote the current dataset table back
+  // into the ORIGINAL source CSV file — keeping it "in sync" with every
+  // edit. That was never actually the intended design. Per the spec:
+  // "Large source data is referenced, never copied" (§3.7), and the
+  // entire "cells as a view, not storage" philosophy (§3.3) — a dataset
+  // is something DuckDB queries live, never something the app writes
+  // back into. Persisted edits belong ONLY in the project's own
+  // local.duckdb + mutations.ndjson; the original CSV is a permanent,
+  // untouched, read-only reference. If you're looking for where edits
+  // actually persist now, see applyCellEdit below — it's the only write
+  // path, and it only ever touches this session's own `dataset` table
+  // (which is local.duckdb once a project is open, :memory: otherwise —
+  // meaning edits genuinely don't persist anywhere without a project,
+  // matching the spec's project-scoped persistence model exactly).
   // FIX (historical): this used to be ensureDatasetLoaded(), which
   // silently loaded a built-in demo dataset any time nothing was loaded
   // yet — meaning a brand new, genuinely empty project (or even a fresh
@@ -181,7 +179,7 @@ class DuckDBSession {
     const conn = await this.getConnection();
     assertSafeColumnName(column);
     const result = await conn.run(
-      `SELECT ${column} AS v FROM dataset WHERE ${this.idColumn} = ${Number(rowId)}`
+      `SELECT ${quoteIdentifier(column)} AS v FROM dataset WHERE ${quoteIdentifier(this.idColumn)} = ${Number(rowId)}`
     );
     const rows = await result.getRowObjects();
     if (rows.length === 0) throw new Error(`Row ${rowId} not found`);
@@ -198,7 +196,7 @@ class DuckDBSession {
     const escaped = String(value).replace(/'/g, "''");
     const literal = value === null || value === "" ? "NULL" : `'${escaped}'`;
     await conn.run(
-      `UPDATE dataset SET ${column} = ${literal} WHERE ${this.idColumn} = ${Number(rowId)}`
+      `UPDATE dataset SET ${quoteIdentifier(column)} = ${literal} WHERE ${quoteIdentifier(this.idColumn)} = ${Number(rowId)}`
     );
   }
   async getSchema() {
@@ -210,9 +208,12 @@ class DuckDBSession {
   }
 }
 function assertSafeColumnName(column) {
-  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(column)) {
-    throw new Error(`Rejected unsafe column name: ${column}`);
+  if (!column || typeof column !== "string" || column.trim() === "") {
+    throw new Error("Rejected empty column name.");
   }
+}
+function quoteIdentifier(name) {
+  return `"${String(name).replace(/"/g, '""')}"`;
 }
 const SCHEMA_VERSION = 1;
 async function createProject(dirPath, { name }) {
@@ -356,18 +357,9 @@ function decideReview(mutationSet) {
   return { autoAccepted: false, acceptedRegions: "none" };
 }
 async function commitMutation(mutationSet, diff, { session: session2, projectDir }) {
-  let didWrite = false;
   for (const cell of diff.cells) {
     if (!cell.changed) continue;
     await session2.applyCellEdit(cell.rowId, cell.column, cell.after);
-    didWrite = true;
-  }
-  if (didWrite) {
-    try {
-      await session2.exportToCsv();
-    } catch (err) {
-      console.error("CSV writeback failed:", err.message);
-    }
   }
   const record = {
     ...mutationSet,
@@ -397,18 +389,9 @@ async function undoLastMutation({ session: session2, projectDir }) {
   const log = await readMutationLog(projectDir);
   if (log.length === 0) return { ok: false, error: "Nothing to undo." };
   const last = log[log.length - 1];
-  let didWrite = false;
   for (const cell of last.diff.cells) {
     if (!cell.changed) continue;
     await session2.applyCellEdit(cell.rowId, cell.column, cell.before);
-    didWrite = true;
-  }
-  if (didWrite) {
-    try {
-      await session2.exportToCsv();
-    } catch (err) {
-      console.error("CSV writeback failed:", err.message);
-    }
   }
   await truncateMutationLog(projectDir, log.length - 1);
   return { ok: true, undone: last };
@@ -466,8 +449,6 @@ electron.ipcMain.handle("project:openDialog", async () => {
     const resumed = await session.resumeExistingDataset();
     if (!resumed && manifest.dataset?.kind === "csv" && manifest.dataset.path) {
       await session.loadCsvDataset(manifest.dataset.path);
-    } else if (resumed && manifest.dataset?.kind === "csv" && manifest.dataset.path) {
-      session.csvSourcePath = manifest.dataset.path;
     }
     return { ok: true, dirPath: filePaths[0], manifest, workbook };
   } catch (err) {
@@ -497,9 +478,8 @@ electron.ipcMain.handle("project:mutationLog", async () => {
   return { entries };
 });
 function getFormatsFilePath() {
-  if (currentProjectDir) return path.join(currentProjectDir, "formats.json");
-  if (session.csvSourcePath) return `${session.csvSourcePath}.formats.json`;
-  return null;
+  if (!currentProjectDir) return null;
+  return path.join(currentProjectDir, "formats.json");
 }
 electron.ipcMain.handle("format:getAll", async () => {
   const formatsPath = getFormatsFilePath();
@@ -510,7 +490,7 @@ electron.ipcMain.handle("format:getAll", async () => {
 electron.ipcMain.handle("format:commit", async (event, entries) => {
   const formatsPath = getFormatsFilePath();
   if (!formatsPath) {
-    return { ok: false, error: "Open a file first — there's nowhere to save formatting yet." };
+    return { ok: false, error: "Formatting needs an open project — there's nowhere to save it without one." };
   }
   try {
     await updateFormatsFile(formatsPath, entries);

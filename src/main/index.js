@@ -93,13 +93,6 @@ ipcMain.handle('project:openDialog', async () => {
     const resumed = await session.resumeExistingDataset();
     if (!resumed && manifest.dataset?.kind === 'csv' && manifest.dataset.path) {
       await session.loadCsvDataset(manifest.dataset.path);
-    } else if (resumed && manifest.dataset?.kind === 'csv' && manifest.dataset.path) {
-      // loadCsvDataset() sets csvSourcePath itself on a fresh import, but
-      // resumeExistingDataset() has no way to know the original file path
-      // (it only inspects local.duckdb's existing schema) — record it here
-      // from the manifest so exportToCsv() (writeback-on-edit) still knows
-      // where to write.
-      session.csvSourcePath = manifest.dataset.path;
     }
     // FIX: this used to omit dirPath entirely — App.jsx's handleOpenProject
     // had nothing real to call setProjectDir with, so it fell back to
@@ -144,16 +137,18 @@ ipcMain.handle('project:mutationLog', async () => {
 // Deliberately its own simple mechanism, separate from the mutations.js
 // pipeline — see the comment at the top of project.js for why.
 //
-// Where formatting is saved depends on what's actually open: inside the
-// project as formats.json if one is, or as a sidecar file next to the CSV
-// itself (e.g. data.csv.formats.json) if not — mirroring exactly how
-// value edits already persist without a project via exportToCsv in
-// duckdb.js. Only truly nowhere-to-save (no project AND no CSV ever
-// loaded) falls through to the error case below.
+// FIX (reverted a design mistake): this briefly also wrote a sidecar file
+// next to a standalone CSV (data.csv.formats.json) when no project was
+// open, mirroring how value edits persist without one. That wasn't
+// actually the intended design — it meant a plain, standard CSV silently
+// grew a GridLab-only companion file next to it, which broke the
+// expectation that opening a bare CSV keeps it exactly that: a plain,
+// portable CSV, untouched by anything but its own values. Per the spec,
+// formatting only ever belongs inside a project's own storage — a bare
+// CSV stays pure CSV, nothing more.
 function getFormatsFilePath() {
-  if (currentProjectDir) return path.join(currentProjectDir, 'formats.json');
-  if (session.csvSourcePath) return `${session.csvSourcePath}.formats.json`;
-  return null;
+  if (!currentProjectDir) return null;
+  return path.join(currentProjectDir, 'formats.json');
 }
 
 ipcMain.handle('format:getAll', async () => {
@@ -166,7 +161,7 @@ ipcMain.handle('format:getAll', async () => {
 ipcMain.handle('format:commit', async (event, entries) => {
   const formatsPath = getFormatsFilePath();
   if (!formatsPath) {
-    return { ok: false, error: "Open a file first — there's nowhere to save formatting yet." };
+    return { ok: false, error: "Formatting needs an open project — there's nowhere to save it without one." };
   }
   try {
     await project.updateFormatsFile(formatsPath, entries);

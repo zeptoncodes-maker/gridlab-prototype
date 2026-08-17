@@ -1,5 +1,11 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { createUniver, LocaleType, merge } from '@univerjs/presets';
+// CellValueType.FORCE_STRING — needed by the mount-time fix below. Not
+// re-exported by @univerjs/presets, so pulled directly from @univerjs/core
+// (previously only a transitive dep, hoisted in via .npmrc's
+// shamefully-hoist; now added as a direct dependency in package.json since
+// we import from it explicitly — see PROJECT root package.json).
+import { CellValueType } from '@univerjs/core';
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core';
 import UniverPresetSheetsCoreEnUS from '@univerjs/preset-sheets-core/locales/en-US';
 // sheets-ui is its own locale namespace (e.g. the "value stored as text"
@@ -271,6 +277,36 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
       const rowId = row[idColumnNameRef.current];
       columns.forEach((col, c) => {
         const cell = { v: row[col] };
+        // FIX (confirmed by reading @univerjs/sheets' actual bundled
+        // source, not guessed): a cell mounted here with only `{ v: "02" }`
+        // and no explicit `.t` has an UNDEFINED type. Any later mutation
+        // that touches the cell — including a pure style-only one like
+        // clicking Bold, which carries no `.v` at all — goes through
+        // Univer's cell-merge path (mergeCellData -> getCellType in
+        // @univerjs/sheets' cell-type.ts). getCellType only short-circuits
+        // and preserves the existing value/type when oldVal.t is ALREADY
+        // CellValueType.FORCE_STRING; with an undefined type it falls
+        // through to re-deriving the type from scratch via
+        // checkCellValueType("02", undefined), which sees a numeric-
+        // looking string with no protecting type and returns NUMBER —
+        // and the merge then rewrites oldValue.v to Number("02") === 2.
+        // That's the exact bug: bolding a cell showing "02" silently
+        // turned its real stored value into 2, right-aligned, leading
+        // zero gone — not a rendering glitch, an actual data corruption
+        // triggered purely by a formatting click.
+        // Explicitly tagging every string-valued cell FORCE_STRING here
+        // (matching how a real spreadsheet treats CSV-sourced text) makes
+        // getCellType take its early-return branch on any future
+        // style-only merge, so the value is left completely untouched.
+        // It does NOT block genuine edits: if the user actually types a
+        // new value into a force-string cell, that command supplies a
+        // real `newVal.v`, which still lets getCellType re-derive a fresh
+        // type from what was actually typed (see the newVal.v !== void 0
+        // guard in that same function) — so typing "5" into this cell
+        // still correctly becomes the number 5.
+        if (typeof row[col] === 'string') {
+          cell.t = CellValueType.FORCE_STRING;
+        }
         // Reapply any stored formatting for this cell — keyed by the row's
         // stable identity (rowId), not sheet position, so it correctly
         // survives search/reset mounting a different subset/order of rows.

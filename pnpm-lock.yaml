@@ -210,6 +210,9 @@ importers:
       '@duckdb/node-api':
         specifier: ^1.5.5-r.4
         version: 1.5.5-r.4
+      '@univerjs/core':
+        specifier: ^0.25.1
+        version: 0.25.1(react@18.3.1)(rxjs@7.8.2)
       '@univerjs/preset-sheets-core':
         specifier: ^0.25.1
         version: 0.25.1(react-dom@18.3.1(react@18.3.1))(react@18.3.1)(rxjs@7.8.2)

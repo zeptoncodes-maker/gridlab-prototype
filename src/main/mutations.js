@@ -105,27 +105,24 @@ export function decideReview(mutationSet) {
 // --- 6. COMMIT ------------------------------------------------------------
 // Applies to DuckDB (the real store), appends the audit-log line, returns
 // enough for the renderer to confirm the edit stuck (or roll it back).
+//
+// FIX (reverted a design mistake, confirmed against the actual spec text):
+// this used to also call session.exportToCsv() here, writing every commit
+// straight back into the ORIGINAL source CSV file — even with no project
+// open. That was never the intended design. Per §3.7 ("Large source data
+// is referenced, never copied") and §3.3 ("cells as a view, not
+// storage"), a source file is something the app queries, never something
+// it writes into. Persisted edits belong only in the project's own
+// local.duckdb + mutations.ndjson below — the CSV stays a permanent,
+// untouched, read-only reference. This also means edits genuinely don't
+// persist anywhere without a project open, matching the spec's
+// project-scoped persistence model exactly (session.applyCellEdit above
+// still runs against whatever's active — :memory: with no project, so
+// nothing survives closing the app in that case, by design).
 export async function commitMutation(mutationSet, diff, { session, projectDir }) {
-  let didWrite = false;
   for (const cell of diff.cells) {
     if (!cell.changed) continue;
     await session.applyCellEdit(cell.rowId, cell.column, cell.after);
-    didWrite = true;
-  }
-
-  // NEW: keep the ORIGINAL csv file (whatever Open File pointed at) in
-  // sync with every committed edit, not just local.duckdb — per product
-  // decision, this happens unconditionally (project open or not) and
-  // after every single edit. Best-effort: the database write above is the
-  // one that must succeed for the edit to "count," so a CSV write failure
-  // (permissions, file open in another program, etc.) is logged but never
-  // rolls back or fails the mutation that already landed in the database.
-  if (didWrite) {
-    try {
-      await session.exportToCsv();
-    } catch (err) {
-      console.error('CSV writeback failed:', err.message);
-    }
   }
 
   const record = {
@@ -170,21 +167,9 @@ export async function undoLastMutation({ session, projectDir }) {
   if (log.length === 0) return { ok: false, error: 'Nothing to undo.' };
 
   const last = log[log.length - 1];
-  let didWrite = false;
   for (const cell of last.diff.cells) {
     if (!cell.changed) continue;
     await session.applyCellEdit(cell.rowId, cell.column, cell.before);
-    didWrite = true;
-  }
-
-  // NEW: same CSV writeback as commitMutation, so an undo is also
-  // reflected in the original file, not just local.duckdb.
-  if (didWrite) {
-    try {
-      await session.exportToCsv();
-    } catch (err) {
-      console.error('CSV writeback failed:', err.message);
-    }
   }
 
   await project.truncateMutationLog(projectDir, log.length - 1);

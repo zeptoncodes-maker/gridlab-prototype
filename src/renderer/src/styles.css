@@ -114,17 +114,44 @@ body {
 #searchInput:focus { outline: none; border-color: var(--accent); }
 #searchInput::placeholder { color: var(--ink-faint); }
 
-button {
+/* FIX: this used to be a bare `button { ... }` element selector, which
+   (with no scoping) styles EVERY <button> in the document — not just our
+   own toolbar/modal buttons, but also every internally-rendered <button>
+   Univer itself mounts for its own UI, like the font-family dropdown's
+   list items. Univer's own dropdown items don't set an explicit text
+   color (they rely on the browser default/inherited black), so our old
+   rule's `color: #fff` — an explicit declaration always wins over an
+   inherited one, regardless of selector specificity — silently painted
+   them white on Univer's own white dropdown background: invisible until
+   hovered, at which point our (also-global) `button:hover` accent
+   background made the white text visible again. That's the exact
+   symptom reported: font list entries only showing up on hover.
+   Scoping every rule below to the four containers that actually hold OUR
+   buttons (top strip, GridPanel's own toolbar, the New Project modal,
+   and the Mutation Log drawer header) confines this styling to our own
+   chrome and leaves Univer's internally-rendered buttons — dropdowns
+   included — completely alone. */
+.topbar button, .console button, .modalDialog button, .mutationPanelHeader button {
   padding: 7px 14px; border: 1px solid var(--accent); background: var(--accent);
   color: #fff; border-radius: 6px; font-size: 12.5px; font-weight: 600;
   cursor: pointer; font-family: var(--sans); transition: background 0.15s ease, transform 0.1s ease;
   white-space: nowrap;
 }
-button:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
-button:active { transform: scale(0.97); }
-button:disabled { opacity: 0.4; cursor: not-allowed; }
-button.ghost { background: transparent; color: var(--ink-soft); border-color: var(--line); }
-button.ghost:hover { background: var(--line-soft); color: var(--ink); }
+.topbar button:hover, .console button:hover, .modalDialog button:hover, .mutationPanelHeader button:hover {
+  background: var(--accent-hover); border-color: var(--accent-hover);
+}
+.topbar button:active, .console button:active, .modalDialog button:active, .mutationPanelHeader button:active {
+  transform: scale(0.97);
+}
+.topbar button:disabled, .console button:disabled, .modalDialog button:disabled, .mutationPanelHeader button:disabled {
+  opacity: 0.4; cursor: not-allowed;
+}
+.topbar button.ghost, .console button.ghost, .modalDialog button.ghost, .mutationPanelHeader button.ghost {
+  background: transparent; color: var(--ink-soft); border-color: var(--line);
+}
+.topbar button.ghost:hover, .console button.ghost:hover, .modalDialog button.ghost:hover, .mutationPanelHeader button.ghost:hover {
+  background: var(--line-soft); color: var(--ink);
+}
 
 /* The actual Univer canvas mount point — takes every remaining pixel. */
 .univerContainer { flex: 1; min-height: 0; background: var(--paper); }
