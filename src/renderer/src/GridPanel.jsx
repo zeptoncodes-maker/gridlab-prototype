@@ -1,11 +1,16 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { createUniver, LocaleType, merge } from '@univerjs/presets';
-// CellValueType.FORCE_STRING — needed by the mount-time fix below. Not
-// re-exported by @univerjs/presets, so pulled directly from @univerjs/core
-// (previously only a transitive dep, hoisted in via .npmrc's
-// shamefully-hoist; now added as a direct dependency in package.json since
-// we import from it explicitly — see PROJECT root package.json).
-import { CellValueType } from '@univerjs/core';
+// CellValueType.FORCE_STRING and isRealNum — needed by the mount-time fix
+// below. Not re-exported by @univerjs/presets, so pulled directly from
+// @univerjs/core (previously only a transitive dep, hoisted in via
+// .npmrc's shamefully-hoist; now added as a direct dependency in
+// package.json since we import from it explicitly — see PROJECT root
+// package.json). isRealNum is the EXACT function Univer's own type-
+// upgrade logic uses to decide "does this string look like a number" —
+// reusing it (instead of writing our own numeric-string regex) guarantees
+// our FORCE_STRING stamping targets precisely the cells actually at risk,
+// no more, no less.
+import { CellValueType, isRealNum } from '@univerjs/core';
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core';
 import UniverPresetSheetsCoreEnUS from '@univerjs/preset-sheets-core/locales/en-US';
 // sheets-ui is its own locale namespace (e.g. the "value stored as text"
@@ -294,8 +299,7 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
         // turned its real stored value into 2, right-aligned, leading
         // zero gone — not a rendering glitch, an actual data corruption
         // triggered purely by a formatting click.
-        // Explicitly tagging every string-valued cell FORCE_STRING here
-        // (matching how a real spreadsheet treats CSV-sourced text) makes
+        // Explicitly tagging a string-valued cell FORCE_STRING here makes
         // getCellType take its early-return branch on any future
         // style-only merge, so the value is left completely untouched.
         // It does NOT block genuine edits: if the user actually types a
@@ -304,7 +308,22 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
         // type from what was actually typed (see the newVal.v !== void 0
         // guard in that same function) — so typing "5" into this cell
         // still correctly becomes the number 5.
-        if (typeof row[col] === 'string') {
+        // FIX (regression found by testing): this used to apply to EVERY
+        // string cell, "6th" and "Engineering" included, not just
+        // numeric-looking ones like "02". That over-broad condition had a
+        // real, visible side effect: @univerjs/engine-render unconditionally
+        // prefixes a cell's edit-mode text with a leading apostrophe
+        // whenever `cell.t === CellValueType.FORCE_STRING` — confirmed
+        // directly in its source (`if (cell.t === FORCE_STRING &&
+        // displayRawFormula) cellText = '${cellText}'`), with no check on
+        // whether the text actually looks numeric. So double-clicking ANY
+        // text cell — "6th", "Numeric-Suffix", anything — started showing
+        // a spurious leading `'` in the editor. Only cells whose value
+        // would otherwise be MISREAD as a number are actually at risk of
+        // the original corruption bug, so this now gates on `isRealNum`
+        // (the exact same check Univer's own type-upgrade logic uses) —
+        // "02" gets protected, "6th" is left alone and edits cleanly.
+        if (typeof row[col] === 'string' && isRealNum(row[col])) {
           cell.t = CellValueType.FORCE_STRING;
         }
         // Reapply any stored formatting for this cell — keyed by the row's
@@ -654,8 +673,20 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
         // Mirror the committed formats into our in-memory copy right away
         // — otherwise the very next mount, before a fresh format.getAll()
         // round-trip, would briefly show them unstyled again.
+        // FIX: this used to always write `newStyle` into the mirror, even
+        // when newStyle was null (a Clear Format save) — leaving a real
+        // `null` entry sitting in formatsRef.current instead of removing
+        // the key outright. The backend (project.js's updateFormatsFile)
+        // already does the right thing — a null/undefined style DELETES
+        // that key from formats.json — so this brought the in-memory
+        // mirror in line with what's actually on disk after a clear.
         formatEntries.forEach(({ rowId, column, newStyle }) => {
-          formatsRef.current[`${rowId}:${column}`] = newStyle;
+          const key = `${rowId}:${column}`;
+          if (newStyle === null || newStyle === undefined) {
+            delete formatsRef.current[key];
+          } else {
+            formatsRef.current[key] = newStyle;
+          }
         });
         pendingFormatsRef.current = new Map();
       } else {
