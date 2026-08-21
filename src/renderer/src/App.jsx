@@ -21,6 +21,22 @@ export default function App() {
   const newProjectInputRef = useRef(null);
 
   const bumpMutationLog = useCallback(() => setMutationLogVersion((v) => v + 1), []);
+  // FIX (reported bug: History panel's Undo reverted the value in DuckDB
+  // but the grid kept showing the OLD value): mutationLogVersion is only
+  // wired to MutationPanel's refreshKey — GridPanel never learned the
+  // underlying data had changed underneath it, so it kept displaying
+  // stale cells after an undo. This is a SEPARATE counter from
+  // mutationLogVersion on purpose: mutationLogVersion also bumps on every
+  // ordinary Save (onMutationCommitted), and a Save must NOT trigger a
+  // grid reload — the grid already shows exactly what was just saved, so
+  // reloading would be pure waste and would disrupt column widths/scroll
+  // position for no reason. Only a genuine EXTERNAL change to the data
+  // (i.e. an undo from the History panel) bumps this one.
+  const [gridDataVersion, setGridDataVersion] = useState(0);
+  const handleMutationUndone = useCallback(() => {
+    bumpMutationLog();
+    setGridDataVersion((v) => v + 1);
+  }, [bumpMutationLog]);
 
   useEffect(() => {
     if (newProjectModalOpen) {
@@ -121,6 +137,7 @@ export default function App() {
           onStatusChange={setStatusText}
           onMutationCommitted={bumpMutationLog}
           onPendingChange={setPendingCount}
+          gridDataVersion={gridDataVersion}
         />
       </div>
 
@@ -130,7 +147,7 @@ export default function App() {
             <MutationPanel
               projectDir={projectDir}
               refreshKey={mutationLogVersion}
-              onUndo={bumpMutationLog}
+              onUndo={handleMutationUndone}
               onClose={() => setMutationPanelOpen(false)}
             />
           </div>

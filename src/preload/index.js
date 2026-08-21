@@ -8,10 +8,12 @@ contextBridge.exposeInMainWorld('gridlabAPI', {
   },
   dataset: {
     openCsvDialog: () => ipcRenderer.invoke('dataset:openCsvDialog'),
+    materializationStatus: () => ipcRenderer.invoke('dataset:materializationStatus'),
   },
   grid: {
     getRows: (offset, limit) => ipcRenderer.invoke('grid:getRows', offset, limit),
-    runQuery: (whereClause) => ipcRenderer.invoke('grid:runQuery', whereClause),
+    runQuery: (whereClause, offset, limit) => ipcRenderer.invoke('grid:runQuery', whereClause, offset, limit),
+    aggregate: (fn, column, whereClause) => ipcRenderer.invoke('grid:aggregate', fn, column, whereClause),
   },
   mutations: {
     editCell: (rowId, column, newValue) =>

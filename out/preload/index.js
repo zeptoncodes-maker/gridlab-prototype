@@ -7,11 +7,13 @@ electron.contextBridge.exposeInMainWorld("gridlabAPI", {
     mutationLog: () => electron.ipcRenderer.invoke("project:mutationLog")
   },
   dataset: {
-    openCsvDialog: () => electron.ipcRenderer.invoke("dataset:openCsvDialog")
+    openCsvDialog: () => electron.ipcRenderer.invoke("dataset:openCsvDialog"),
+    materializationStatus: () => electron.ipcRenderer.invoke("dataset:materializationStatus")
   },
   grid: {
     getRows: (offset, limit) => electron.ipcRenderer.invoke("grid:getRows", offset, limit),
-    runQuery: (whereClause) => electron.ipcRenderer.invoke("grid:runQuery", whereClause)
+    runQuery: (whereClause, offset, limit) => electron.ipcRenderer.invoke("grid:runQuery", whereClause, offset, limit),
+    aggregate: (fn, column, whereClause) => electron.ipcRenderer.invoke("grid:aggregate", fn, column, whereClause)
   },
   mutations: {
     editCell: (rowId, column, newValue) => electron.ipcRenderer.invoke("mutations:editCell", { rowId, column, newValue }),

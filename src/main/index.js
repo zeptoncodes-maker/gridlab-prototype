@@ -91,8 +91,22 @@ ipcMain.handle('project:openDialog', async () => {
     // project (nothing in local.duckdb yet) falls through to importing the
     // CSV for the first time.
     const resumed = await session.resumeExistingDataset();
-    if (!resumed && manifest.dataset?.kind === 'csv' && manifest.dataset.path) {
-      await session.loadCsvDataset(manifest.dataset.path);
+    // NEW (Parquet support): accept any recorded dataset kind, not just
+    // 'csv'. A Parquet-backed project used to fail BOTH branches of this
+    // check silently — never re-importing, never recording its source
+    // path — so writeback-on-edit would have been a no-op for it.
+    const hasDataset = !!manifest.dataset?.path;
+    if (!resumed && hasDataset) {
+      await session.loadDataset(manifest.dataset.path);
+    } else if (resumed && hasDataset) {
+      // loadDataset() sets sourceFilePath/sourceFormat itself on a fresh
+      // import, but resumeExistingDataset() has no way to know the
+      // original file path (it only inspects local.duckdb's existing
+      // schema) — record both here from the manifest so
+      // exportToSourceFile() (writeback-on-edit) knows where to write AND
+      // in which format.
+      session.sourceFilePath = manifest.dataset.path;
+      session.sourceFormat = manifest.dataset.kind === 'parquet' ? 'parquet' : 'csv';
     }
     // FIX: this used to omit dirPath entirely — App.jsx's handleOpenProject
     // had nothing real to call setProjectDir with, so it fell back to
@@ -137,18 +151,16 @@ ipcMain.handle('project:mutationLog', async () => {
 // Deliberately its own simple mechanism, separate from the mutations.js
 // pipeline — see the comment at the top of project.js for why.
 //
-// FIX (reverted a design mistake): this briefly also wrote a sidecar file
-// next to a standalone CSV (data.csv.formats.json) when no project was
-// open, mirroring how value edits persist without one. That wasn't
-// actually the intended design — it meant a plain, standard CSV silently
-// grew a GridLab-only companion file next to it, which broke the
-// expectation that opening a bare CSV keeps it exactly that: a plain,
-// portable CSV, untouched by anything but its own values. Per the spec,
-// formatting only ever belongs inside a project's own storage — a bare
-// CSV stays pure CSV, nothing more.
+// Where formatting is saved depends on what's actually open: inside the
+// project as formats.json if one is, or as a sidecar file next to the CSV
+// itself (e.g. data.csv.formats.json) if not — mirroring exactly how
+// value edits already persist without a project via exportToCsv in
+// duckdb.js. Only truly nowhere-to-save (no project AND no CSV ever
+// loaded) falls through to the error case below.
 function getFormatsFilePath() {
-  if (!currentProjectDir) return null;
-  return path.join(currentProjectDir, 'formats.json');
+  if (currentProjectDir) return path.join(currentProjectDir, 'formats.json');
+  if (session.sourceFilePath) return `${session.sourceFilePath}.formats.json`;
+  return null;
 }
 
 ipcMain.handle('format:getAll', async () => {
@@ -161,7 +173,7 @@ ipcMain.handle('format:getAll', async () => {
 ipcMain.handle('format:commit', async (event, entries) => {
   const formatsPath = getFormatsFilePath();
   if (!formatsPath) {
-    return { ok: false, error: "Formatting needs an open project — there's nowhere to save it without one." };
+    return { ok: false, error: "Open a file first — there's nowhere to save formatting yet." };
   }
   try {
     await project.updateFormatsFile(formatsPath, entries);
@@ -176,17 +188,34 @@ ipcMain.handle('format:commit', async (event, entries) => {
 ipcMain.handle('dataset:openCsvDialog', async () => {
   try {
     const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
-      title: 'Open CSV file',
-      filters: [{ name: 'CSV files', extensions: ['csv'] }],
+      title: 'Open data file',
+      // NEW (Parquet support): Parquet listed first as the Tier-1 format
+      // per spec §2.3. The combined filter is the default so users don't
+      // have to know which format their file is before finding it.
+      filters: [
+        { name: 'Data files', extensions: ['parquet', 'pq', 'csv'] },
+        { name: 'Parquet files', extensions: ['parquet', 'pq'] },
+        { name: 'CSV files', extensions: ['csv'] },
+      ],
       properties: ['openFile'],
     });
     if (canceled || filePaths.length === 0) return { canceled: true };
     const filePath = filePaths[0];
-    const { rowCount } = await session.loadCsvDataset(filePath);
+    // NEW: loadCsvDataset no longer returns rowCount — getting an exact
+    // count now means either a live COUNT(*) scan or waiting for
+    // background materialization, neither of which should block this
+    // dialog from returning. The renderer never used rowCount from here
+    // anyway (loadInitialWindow's own grid:getRows call gets a real,
+    // current total right after this resolves).
+    const { format } = await session.loadDataset(filePath);
     if (currentProjectDir) {
-      await project.updateManifest(currentProjectDir, { dataset: { kind: 'csv', path: filePath } });
+      // NEW (Parquet support): record the ACTUAL format rather than always
+      // claiming 'csv' — the manifest is meant to describe the real
+      // dataset, and a future reopen path that trusts this field would
+      // otherwise read a Parquet file with the CSV reader.
+      await project.updateManifest(currentProjectDir, { dataset: { kind: format, path: filePath } });
     }
-    return { fileName: path.basename(filePath), rowCount };
+    return { fileName: path.basename(filePath) };
   } catch (err) {
     return { error: err.message };
   }
@@ -196,20 +225,43 @@ ipcMain.handle('dataset:openCsvDialog', async () => {
 
 ipcMain.handle('grid:getRows', async (event, offset, limit) => {
   try {
-    const rows = await session.getRows(offset, limit);
-    return { rows, datasetLoaded: session.datasetLoaded };
+    const { rows, totalRows, materializing } = await session.getRows(offset, limit);
+    return { rows, totalRows, materializing, datasetLoaded: session.datasetLoaded };
   } catch (err) {
     return { error: err.message };
   }
 });
 
-ipcMain.handle('grid:runQuery', async (event, whereClause) => {
+ipcMain.handle('grid:runQuery', async (event, whereClause, offset, limit) => {
   try {
-    const rows = await session.runQuery(whereClause);
-    return { rows };
+    const { rows, totalMatches, materializing } = await session.runQuery(whereClause, offset, limit);
+    return { rows, totalMatches, materializing };
   } catch (err) {
     return { error: err.message };
   }
+});
+
+// NEW (file-open bottleneck fix): a lightweight, side-effect-free status
+// check — does NOT run any query or touch the grid's data, just reads the
+// in-memory flag. Lets the renderer poll for "has background
+// materialization finished yet?" purely to update its status text,
+// without any risk of disturbing unsaved edits the way silently
+// re-fetching and remounting the grid would.
+// NEW (aggregate pushdown): backs the DBSUM/DBAVG/... custom formula
+// functions registered in GridPanel. Errors are returned as a value
+// rather than thrown so the formula cell can show a real message instead
+// of the whole calculation silently failing.
+ipcMain.handle('grid:aggregate', async (event, fn, column, whereClause) => {
+  try {
+    const value = await session.aggregate(fn, column, whereClause);
+    return { ok: true, value };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+ipcMain.handle('dataset:materializationStatus', () => {
+  return { materializing: session.materializing };
 });
 
 // --- Mutation pipeline -----------------------------------------------------

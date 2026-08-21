@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createUniver, LocaleType, merge } from '@univerjs/presets';
 // CellValueType.FORCE_STRING and isRealNum — needed by the mount-time fix
 // below. Not re-exported by @univerjs/presets, so pulled directly from
@@ -9,8 +9,9 @@ import { createUniver, LocaleType, merge } from '@univerjs/presets';
 // upgrade logic uses to decide "does this string look like a number" —
 // reusing it (instead of writing our own numeric-string regex) guarantees
 // our FORCE_STRING stamping targets precisely the cells actually at risk,
-// no more, no less.
-import { CellValueType, isRealNum } from '@univerjs/core';
+// no more, no less. IUndoRedoService is needed by the undo-history-reset
+// fix in mountRowsIntoUniver — see the comment there for why.
+import { CellValueType, isRealNum, IUndoRedoService } from '@univerjs/core';
 import { UniverSheetsCorePreset } from '@univerjs/preset-sheets-core';
 import UniverPresetSheetsCoreEnUS from '@univerjs/preset-sheets-core/locales/en-US';
 // sheets-ui is its own locale namespace (e.g. the "value stored as text"
@@ -66,13 +67,19 @@ const EDITABLE_WINDOW_SIZE = 2000;
 const SHEET_ID = 'sheet-01';
 const WORKBOOK_ID = 'gridlab-workbook';
 
-export default function GridPanel({ projectDir, onDimsChange, onStatusChange, onMutationCommitted, onPendingChange }) {
+export default function GridPanel({ projectDir, onDimsChange, onStatusChange, onMutationCommitted, onPendingChange, gridDataVersion }) {
   const containerRef = useRef(null);
   const searchInputRef = useRef(null);
   const univerApiRef = useRef(null);
+  // The raw `univer` instance (distinct from `univerAPI`, the Facade) —
+  // only needed for one thing: reaching IUndoRedoService via its
+  // __getInjector() escape hatch, to clear undo history after every
+  // mount. See the comment in mountRowsIntoUniver for why that's needed.
+  const univerRef = useRef(null);
+  const aggregatesRegisteredRef = useRef(false); // DB aggregate functions are registered once, after the first workbook exists — see registerAggregateFunctionsOnce
   const columnsRef = useRef([]); // index -> column name, index 0 is the header row's column 0
   const rowIdsRef = useRef([]); // sheet body row index (0-based, header excluded) -> DB row id
-  const fullDatasetColumnWidthsRef = useRef([]); // widths captured ONLY when leaving the full-dataset view (not a search result) — see the searchResultCount check in mountRowsIntoUniver. This is what Reset restores.
+  const fullDatasetColumnWidthsRef = useRef([]); // widths captured ONLY when leaving the full-dataset view (not a search result) — see the searchQuery check in mountRowsIntoUniver. This is what Reset restores.
   const idColumnNameRef = useRef('id');
   // FIX: this used to be a boolean (suppressNextCommandRef), which only
   // correctly skips ONE re-entrant command. Both the header-revert loop and
@@ -102,11 +109,45 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
   const pendingFormatsRef = useRef(new Map()); // "rowId:column" -> { rowId, column, newStyle } staged but not yet saved
 
   const [searchValue, setSearchValue] = useState('');
-  const [searchResultCount, setSearchResultCount] = useState(null); // null = not searching; number = rows from the last search, currently mounted into the grid
+  // NEW (unifying search with windowing): replaces the old flag by that
+  // name. null = viewing the full dataset; a string =
+  // the WHERE clause currently applied, so loadWindow knows to query
+  // filtered results instead of the full table — search is no longer a
+  // separate, hardcoded-200-row code path, it's the SAME windowing
+  // mechanism with a filter attached. See loadWindow below.
+  const [activeSearch, setActiveSearch] = useState(null);
   const [searchError, setSearchError] = useState(null);
   const [gridError, setGridError] = useState(null);
   const [noDataset, setNoDataset] = useState(false); // true when nothing has been loaded yet (new/empty project, or fresh app launch)
   const [pendingCount, setPendingCount] = useState(0); // number of unsaved edits currently staged (value edits + format edits combined)
+  // Windowing (per Phase 0 spike findings — see /spikes/phase0-spike2-...):
+  // Univer has no lazy/virtualized data-binding mode for editable sheets,
+  // so a true "never materialize, scroll issues new range queries" view
+  // sheet per spec §3.3 isn't achievable on top of it as used here. This
+  // is the honest, buildable middle ground: successive bounded windows of
+  // EDITABLE_WINDOW_SIZE rows, all of them reachable via Prev/Next,
+  // instead of the dataset (or a search's matches) being hard-capped
+  // forever with no way to reach anything past the first window. `total`
+  // means "total rows in the CURRENT view" — the real dataset size
+  // normally, or the true match count while a search is active — and
+  // drives both the dims badge and whether Prev/Next render at all
+  // (hidden entirely when everything already fits in one window).
+  const [windowInfo, setWindowInfo] = useState({ offset: 0, total: 0 });
+  // The TRUE dataset size — distinct from windowInfo.total, which means
+  // "rows in the CURRENT view" and shrinks to the match count while a
+  // search is active. The dims badge should always reflect the real
+  // dataset shape ("50,000 x 3"), never look like it shrank just because
+  // a search is filtering what's currently displayed.
+  const [datasetTotal, setDatasetTotal] = useState(0);
+  // NEW (file-open bottleneck fix): true while the real `dataset` table is
+  // still being built in the background after opening a large CSV —
+  // browsing/searching already works (reading straight from the file),
+  // this is purely a status indicator. Polled via a lightweight,
+  // side-effect-free IPC call (see the useEffect below) rather than
+  // waiting for the user to trigger another getRows/runQuery call, so the
+  // banner actually clears on its own once indexing finishes even if the
+  // user just sits on the first page.
+  const [materializing, setMaterializing] = useState(false);
 
   // Every place that changes either pending map calls this instead of
   // setPendingCount directly, so the displayed count/Save button always
@@ -122,7 +163,7 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
 
   // --- Univer bootstrap ----------------------------------------------------
   useEffect(() => {
-    const { univerAPI } = createUniver({
+    const { univerAPI, univer } = createUniver({
       locale: LocaleType.EN_US,
       locales: {
         [LocaleType.EN_US]: merge(
@@ -151,6 +192,9 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
       ],
     });
     univerApiRef.current = univerAPI;
+    univerRef.current = univer;
+
+
 
     // --- Edit interception ---------------------------------------------
     //
@@ -203,21 +247,113 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectDir]);
 
+  // FIX (reported bug): the History panel's Undo correctly reverts the
+  // value in DuckDB, but nothing told the grid its underlying data had
+  // changed — so the cell kept showing the OLD value even though the
+  // database had already been reverted. gridDataVersion bumps ONLY on a
+  // genuine external data change (a History-panel undo), never on an
+  // ordinary Save — see the comment on it in App.jsx for why that
+  // distinction matters. Reloads the CURRENT window (same offset, same
+  // active search) rather than jumping back to page 1, so an undo of a
+  // row on page 50 doesn't yank the user back to the top.
+  useEffect(() => {
+    // Skip the initial mount — the projectDir effect above already loads
+    // the first window, and reloading again here would double-load.
+    if (!gridDataVersion) return;
+    (async () => {
+      if (!(await confirmDiscardPendingEdits())) {
+        // They chose to keep their unsaved edits. The DB has ALREADY been
+        // reverted at this point though, so the grid is now genuinely out
+        // of sync with the real data — say so plainly rather than leaving
+        // them looking at stale values with no indication anything's off.
+        setGridError(
+          'An undo changed the underlying data, but the grid still shows your unsaved edits — click Reset to reload the real values.'
+        );
+        return;
+      }
+      await loadWindow(windowInfo.offset, { autoFitColumns: false, whereClause: activeSearch });
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gridDataVersion]);
+
+  // NEW (file-open bottleneck fix): while background materialization is
+  // pending, poll a lightweight status check every 2s so the banner clears
+  // on its own once indexing finishes — even if the user never triggers
+  // another getRows/runQuery call (e.g. they're just sitting on the first
+  // page, reading). Deliberately does NOT touch the grid or Univer at
+  // all — just flips the status flag — so there's zero risk of this timer
+  // firing mid-edit and silently discarding unsaved work the way a real
+  // data re-fetch and remount could.
+  useEffect(() => {
+    if (!materializing) return;
+    const interval = setInterval(async () => {
+      const status = await window.gridlabAPI.dataset.materializationStatus();
+      if (!status.materializing) setMaterializing(false);
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [materializing]);
+
   async function loadInitialWindow({ autoFitColumns = true } = {}) {
+    // Starting over always means "no filter" — a fresh project, a newly
+    // opened CSV, or Reset should never silently carry over a search from
+    // whatever was loaded before.
+    setActiveSearch(null);
+    setSearchValue('');
+    setSearchError(null);
+    await loadWindow(0, { autoFitColumns, whereClause: null });
+  }
+
+  // Loads the window starting at `offset`. `whereClause` is explicit
+  // rather than implicitly read from `activeSearch` state — every caller
+  // says exactly what filter (if any) it wants, so there's no ambiguity
+  // about whether a given load is "the full dataset" or "a search's Nth
+  // page": null/undefined means the full dataset via getRows; a string
+  // means a filtered, windowed search via runQuery. Same offset/limit
+  // shape either way — search is just a filter on top of the same
+  // windowing mechanism, not a separate hardcoded-200-row path anymore.
+  async function loadWindow(offset, { autoFitColumns = true, statusLabel, whereClause, onError = setGridError } = {}) {
     const [result, formatResult] = await Promise.all([
-      window.gridlabAPI.grid.getRows(0, EDITABLE_WINDOW_SIZE),
+      whereClause
+        ? window.gridlabAPI.grid.runQuery(whereClause, offset, EDITABLE_WINDOW_SIZE)
+        : window.gridlabAPI.grid.getRows(offset, EDITABLE_WINDOW_SIZE),
       window.gridlabAPI.format.getAll(),
     ]);
     if (result.error) {
-      setGridError(result.error);
-      return;
+      onError(result.error);
+      return false;
     }
     formatsRef.current = formatResult?.formats || {};
-    if (!result.datasetLoaded) {
+    if (!whereClause && !result.datasetLoaded) {
       showEmptyState();
-      return;
+      return false;
     }
-    mountRowsIntoUniver(result.rows, { autoFitColumns });
+    // getRows returns `totalRows`, runQuery returns `totalMatches` — same
+    // meaning ("how many rows exist in this view"), different name
+    // because one's the whole dataset and the other's a filtered count.
+    const total = whereClause ? result.totalMatches : result.totalRows;
+    setWindowInfo({ offset, total });
+    // NEW (file-open bottleneck fix): reflects whether THIS load came from
+    // the live-CSV fallback (background table not ready yet) or the fast
+    // materialized path. The polling effect below takes over from here to
+    // catch the moment materialization finishes even without another load.
+    setMaterializing(result.materializing || false);
+    // Only a non-filtered load reflects the TRUE dataset size — a
+    // search's match count should never overwrite what the dims badge
+    // remembers as "how big is my actual data." Computed explicitly here
+    // (rather than having mountRowsIntoUniver read datasetTotal state
+    // directly) since React state updates aren't visible synchronously to
+    // code running later in this same function call.
+    const currentDatasetTotal = whereClause ? datasetTotal : total;
+    if (!whereClause) setDatasetTotal(total);
+    mountRowsIntoUniver(result.rows, {
+      autoFitColumns,
+      statusLabel,
+      windowOffset: offset,
+      totalRows: total,
+      datasetTotal: currentDatasetTotal,
+      searchQuery: whereClause || null,
+    });
+    return true;
   }
 
   // Nothing has ever been loaded into this project/session — a brand-new
@@ -227,7 +363,10 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
   function showEmptyState() {
     setNoDataset(true);
     setGridError(null);
-    setSearchResultCount(null);
+    setActiveSearch(null);
+    setWindowInfo({ offset: 0, total: 0 });
+    setDatasetTotal(0);
+    setMaterializing(false);
     pendingEditsRef.current = new Map();
     pendingFormatsRef.current = new Map();
     setPendingCount(0);
@@ -242,7 +381,75 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     );
   }
 
-  function mountRowsIntoUniver(rows, { statusLabel, autoFitColumns = true } = {}) {
+
+  // NEW (aggregate pushdown — spec §3.3): DB-backed aggregate functions
+  // that run against the WHOLE dataset in DuckDB, not just the ~2,000
+  // rows currently mounted in the grid.
+  //
+  // Why these are separate, explicitly-named functions rather than
+  // transparently overriding SUM/AVERAGE: Univer's built-in SUM evaluates
+  // against its own in-memory cells, and a windowed grid only ever holds
+  // one page of them. Verified directly — =SUM(A1:A100000) over a sheet
+  // with 10 mounted rows returned 1,000 instead of the true 10,000,000,
+  // with no error. Silently redefining SUM to sometimes mean "the whole
+  // dataset" and sometimes "these cells" would make that ambiguity worse.
+  // Spec §7 explicitly sanctions this: "fall back to explicit SQL
+  // aggregates rather than transparent pushdown — ugly but shippable."
+  //
+  // Usage: =DBSUM("salary")  or  =DBSUM("salary", "department = 'Eng'")
+  //
+  // TIMING (this caused a real blank-screen crash, fixed here): this must
+  // run AFTER the first createWorkbook, never right after createUniver.
+  // Univer only starts its sheet-type plugins when the first unit of that
+  // type is created (see the isFirstTime/_startedTypes gate in Univer's
+  // own instance-service create handler) — and IRegisterFunctionService is
+  // bound by UniverSheetsFormulaPlugin's startup. Calling it before any
+  // workbook exists throws a redi QuantityCheckError ("Expect 1
+  // dependency item(s) ... but get 0"), which killed the whole renderer.
+  function registerAggregateFunctionsOnce() {
+    if (aggregatesRegisteredRef.current) return;
+    const AGGREGATES = [
+      ['DBSUM', 'SUM', 'Sum a whole dataset column in the database'],
+      ['DBAVG', 'AVG', 'Average a whole dataset column in the database'],
+      ['DBMIN', 'MIN', 'Minimum of a whole dataset column in the database'],
+      ['DBMAX', 'MAX', 'Maximum of a whole dataset column in the database'],
+      ['DBCOUNT', 'COUNT', 'Count non-null values in a whole dataset column'],
+      ['DBMEDIAN', 'MEDIAN', 'Median of a whole dataset column in the database'],
+      ['DBSTDEV', 'STDDEV', 'Standard deviation of a whole dataset column'],
+    ];
+    try {
+      const formulaEngine = univerApiRef.current.getFormula();
+      for (const [fnName, sqlFn, description] of AGGREGATES) {
+        formulaEngine.registerAsyncFunction(
+          fnName,
+          async (column, whereClause) => {
+            const col = column === null || column === undefined ? '' : String(column).trim();
+            if (!col) {
+              return { errorType: 'VALUE', errorMessage: `${fnName} needs a column name, e.g. ${fnName}("salary")` };
+            }
+            const where =
+              whereClause === null || whereClause === undefined ? null : String(whereClause).trim() || null;
+            const result = await window.gridlabAPI.grid.aggregate(sqlFn, col, where);
+            if (!result.ok) {
+              // Surface the real backend message in the cell (unknown
+              // column, bad WHERE clause) rather than a bare #ERROR.
+              return { errorType: 'NAME', errorMessage: result.error };
+            }
+            return result.value;
+          },
+          description
+        );
+      }
+      aggregatesRegisteredRef.current = true;
+    } catch (err) {
+      // Never fatal: a failure here must degrade to "DB aggregates
+      // unavailable", never a blank app. Leaving the ref false lets the
+      // next mount retry rather than giving up permanently.
+      console.error('Registering DB aggregate functions failed:', err);
+    }
+  }
+
+  function mountRowsIntoUniver(rows, { statusLabel, autoFitColumns = true, windowOffset, totalRows, datasetTotal: currentDatasetTotal, searchQuery } = {}) {
     setNoDataset(false);
     if (rows.length === 0) {
       setGridError('No rows matched — nothing to load into the grid. Clear search to go back.');
@@ -426,14 +633,13 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     // would silently overwrite the "real" full-dataset widths with the
     // search result's auto-fit widths. Then Reset — which is supposed to
     // restore your original manual sizing — would restore THOSE instead,
-    // making it look like Reset "forgot" your resize. searchResultCount
-    // here still reflects whatever was on screen a moment ago (its setter
-    // hasn't landed in this closure yet), so this only updates the
-    // full-dataset memory when we're actually leaving the full-dataset
-    // view — never when leaving a search result.
+    // making it look like Reset "forgot" your resize. `searchQuery` here
+    // describes the mount about to happen (passed in from loadWindow), so
+    // this only updates the full-dataset memory when we're actually
+    // mounting the full dataset — never a search result.
     if (univerApiRef.current.getActiveWorkbook()) {
       const prevSheet = univerApiRef.current.getActiveWorkbook().getActiveSheet();
-      if (searchResultCount === null) {
+      if (!searchQuery) {
         fullDatasetColumnWidthsRef.current = Array.from({ length: columns.length }, (_, c) =>
           prevSheet.getColumnWidth(c)
         );
@@ -442,6 +648,9 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     }
 
     univerApiRef.current.createWorkbook(workbookData);
+    // Must come AFTER the first createWorkbook — see the timing note on
+    // registerAggregateFunctionsOnce. No-ops on every subsequent mount.
+    registerAggregateFunctionsOnce();
 
     // Either auto-fit every column to its actual content (Univer's own
     // built-in text-measurement, not a guessed character count —
@@ -474,7 +683,36 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
       console.error('Column width operation failed:', err);
     }
 
-    onDimsChange({ rows: rowIdsRef.current.length, cols: columns.length });
+    // FIX (reported directly by testing, confirmed via Univer's own
+    // source): autoResizeColumns/setColumnWidth above go through
+    // AutoWidthController.getUndoRedoParamsOfColWidth — Univer records
+    // these as genuine undoable actions BY DESIGN, the same as if the
+    // user had resized a column by hand. But every mount runs this
+    // width-restoration logic internally (Reset, Prev/Next, Open File,
+    // project switch) — none of that is something the user actually did,
+    // it's GridLab restoring its own remembered state. Left alone, each
+    // mount silently pushes one "undo" entry per column onto Univer's
+    // history — a 4-column dataset left the Undo button clickable 3-4
+    // times after a single Reset, and clicking Reset again just kept
+    // adding more on top. A fresh mount should always be a clean slate
+    // for undo history, exactly like pendingEditsRef/originalValuesRef
+    // already get reset fresh every time — so this clears it
+    // unconditionally after every mount, not just after Reset
+    // specifically, since the same width-restoration logic runs on all
+    // of them. IUndoRedoService isn't reachable through the univerAPI
+    // Facade — only through the raw `univer` instance's __getInjector()
+    // escape hatch (an intentionally exposed, if undocumented-in-Facade,
+    // accessor — marked @ignore in Univer's own source, not a hack).
+    try {
+      univerRef.current.__getInjector().get(IUndoRedoService).clearUndoRedo(WORKBOOK_ID);
+    } catch (err) {
+      console.error('Clearing undo/redo history after mount failed:', err);
+    }
+
+    // NEW (windowing): the dims badge always reports the TRUE dataset
+    // size ("50,000 x 3"), whether or not a search is currently narrowing
+    // what's actually displayed — see the datasetTotal comment above.
+    onDimsChange({ rows: currentDatasetTotal ?? rowIdsRef.current.length, cols: columns.length });
     // FIX: this used to always claim "(edits stay unsaved)" whenever no
     // project was open — no longer true. Since demo data was removed, the
     // ONLY way to have real data loaded at all is via Open File, which
@@ -482,8 +720,22 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     // a project is open (see exportToCsv in duckdb.js). A project ADDS
     // local.duckdb + the mutation log on top of that — it isn't the only
     // thing making edits durable anymore.
+    // NEW (windowing): when there's more than one page, spell out exactly
+    // which rows are currently on screen and editable ("rows 2,001-4,000
+    // of 50,000") rather than just a bare loaded-row count, since that
+    // count alone would otherwise look like the whole dataset. Mentions
+    // the active search filter too, when there is one, so "of 50,000"
+    // reads as "of 50,000 matches" rather than looking like the dataset
+    // itself shrank.
+    const rangePrefix =
+      windowOffset !== undefined && totalRows !== undefined && totalRows > rows.length
+        ? `rows ${(windowOffset + 1).toLocaleString()}-${(windowOffset + rows.length).toLocaleString()} of ${totalRows.toLocaleString()}`
+        : `${rows.length.toLocaleString()}`;
+    const windowRangeLabel = searchQuery
+      ? `${rangePrefix} match${totalRows === 1 ? '' : 'es'} for "${searchQuery}"`
+      : `${rangePrefix} ${statusLabel || 'rows loaded into the grid'}`;
     onStatusChange(
-      `DuckDB connected${projectDir ? ` · project open` : ' · no project (edits still save to the opened file)'} · ${rows.length.toLocaleString()} ${statusLabel || 'rows loaded into the grid'}`
+      `DuckDB connected${projectDir ? ` · project open` : ' · no project (edits still save to the opened file)'} · ${windowRangeLabel}`
     );
   }
 
@@ -708,19 +960,16 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     }
   }
 
-  // --- Search (now fully editable: results are mounted straight into
-  // Univer via the same path as the initial window, so a search just
-  // swaps what's currently resident in the grid — no separate read-only
-  // view anymore). ------------------------------------------------------
+  // --- Search (unified with windowing: a search is just a filtered,
+  // windowed query now, not a separate hardcoded-200-row path — see
+  // loadWindow's whereClause param). ---------------------------------------
   async function runSearch() {
     setSearchError(null);
     // FIX: an empty search box used to still hit the backend — DuckDB's
     // WHERE clause sanitizer treats an empty string as "match everything"
-    // (WHERE 1=1), so Run with nothing typed silently ran a REAL query,
-    // capped at 200 rows, and fully remounted the grid (its own fresh
-    // auto-fit included) — even though nothing was actually searched for.
-    // That's what caused "Showing 200 search result(s)..." and the grid's
-    // formatting visibly resetting on an empty Run. There's nothing to
+    // (WHERE 1=1), so Run with nothing typed silently ran a REAL query
+    // and fully remounted the grid (its own fresh auto-fit included) —
+    // even though nothing was actually searched for. There's nothing to
     // search for an empty box, so just say that and stop here.
     if (!searchValue.trim()) {
       setSearchError('Type something to search for first — e.g. department = Engineering.');
@@ -731,29 +980,70 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
       return;
     }
     if (!(await confirmDiscardPendingEdits())) return;
-    const result = await window.gridlabAPI.grid.runQuery(searchValue);
-    if (result.error) {
-      setSearchError(result.error);
-      return;
-    }
-    mountRowsIntoUniver(result.rows, { statusLabel: 'search result(s) loaded into the grid' });
-    setSearchResultCount(result.rows.length);
+    // Search-specific failures (a malformed WHERE clause) should surface
+    // in the search-scoped error banner, not the generic grid one — hence
+    // the explicit onError override. activeSearch is only committed on
+    // success: a failed search shouldn't leave Prev/Next (or the "Showing
+    // results for..." banner) thinking a filter is active when it never
+    // actually applied.
+    const ok = await loadWindow(0, {
+      autoFitColumns: true,
+      whereClause: searchValue,
+      onError: setSearchError,
+    });
+    if (ok) setActiveSearch(searchValue);
   }
 
   async function clearSearch() {
     if (!(await confirmDiscardPendingEdits())) return;
-    setSearchValue('');
-    setSearchError(null);
-    setSearchResultCount(null);
     // autoFitColumns: false — per product decision, Reset restores the
     // full dataset but should NOT touch column widths. It's the same
     // dataset that was already loaded, not a fresh file, so whatever
     // widths are currently set (auto-fit from the last real load, or
     // manually resized since) should stick around exactly as they are.
+    // loadInitialWindow itself resets searchValue/searchError/activeSearch
+    // — see its own comment — so nothing else needs to happen here.
     await loadInitialWindow({ autoFitColumns: false });
   }
 
-  const handleOpenCsv = useCallback(async () => {
+  // --- Windowing (Prev/Next) ----------------------------------------------
+  // Same discard-confirmation gate as search/Reset/Open File — switching
+  // windows swaps out everything currently mounted in Univer, so unsaved
+  // edits in the window being left behind would otherwise vanish with no
+  // warning, exactly like the bug those other call sites already guard
+  // against. Passing activeSearch through as whereClause means Prev/Next
+  // work identically whether you're paging the full dataset or paging
+  // through a search's matches — same mechanism either way.
+  async function goToNextWindow() {
+    if (!(await confirmDiscardPendingEdits())) return;
+    const nextOffset = windowInfo.offset + EDITABLE_WINDOW_SIZE;
+    if (nextOffset >= windowInfo.total) return;
+    await loadWindow(nextOffset, { autoFitColumns: false, whereClause: activeSearch });
+  }
+
+  async function goToPreviousWindow() {
+    if (!(await confirmDiscardPendingEdits())) return;
+    const prevOffset = Math.max(0, windowInfo.offset - EDITABLE_WINDOW_SIZE);
+    await loadWindow(prevOffset, { autoFitColumns: false, whereClause: activeSearch });
+  }
+
+  // FIX (reported bug: status said "no project" after Open File even with
+  // a project genuinely open): this used to be
+  // useCallback(async () => {...}, []) — an EMPTY dependency array, which
+  // froze the whole call chain at its first-render values. It captured
+  // the first render's loadInitialWindow -> loadWindow ->
+  // mountRowsIntoUniver, and therefore the first render's `projectDir`,
+  // which is null at app startup before any project exists. So the status
+  // line mountRowsIntoUniver builds always read projectDir as null no
+  // matter how many projects were opened afterwards, and reported "no
+  // project (edits still save to the opened file)". Nothing was actually
+  // wrong with the project OR the status logic — the handler was just
+  // reading a permanently stale snapshot of it.
+  // Now a plain function, re-created every render like every other
+  // handler here (runSearch, clearSearch, goToNextWindow...), so it always
+  // sees current state. Nothing needed the referential stability
+  // useCallback was providing — it's only ever used as an onClick.
+  async function handleOpenCsv() {
     if (!(await confirmDiscardPendingEdits())) return;
     const result = await window.gridlabAPI.dataset.openCsvDialog();
     if (result.canceled) return;
@@ -761,10 +1051,12 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
       setGridError(result.error);
       return;
     }
-    onStatusChange(`DuckDB connected · ${result.fileName}`);
+    // loadInitialWindow -> mountRowsIntoUniver sets the full, correct
+    // status (including project state) itself, so there's deliberately no
+    // onStatusChange call here — an earlier hardcoded one that never
+    // mentioned the project was removed as part of this same fix.
     await loadInitialWindow();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }
 
   return (
     <div className="card">
@@ -781,6 +1073,30 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
         />
         <button onClick={runSearch}>Run</button>
         <button className="ghost" onClick={clearSearch}>Reset</button>
+        {windowInfo.total > EDITABLE_WINDOW_SIZE && (
+          <div className="windowNav">
+            <button
+              className="ghost"
+              onClick={goToPreviousWindow}
+              disabled={windowInfo.offset === 0}
+            >
+              ◀ Prev
+            </button>
+            <span className="windowNavLabel">
+              {(windowInfo.offset + 1).toLocaleString()}–
+              {Math.min(windowInfo.offset + EDITABLE_WINDOW_SIZE, windowInfo.total).toLocaleString()}
+              {' of '}
+              {windowInfo.total.toLocaleString()}
+            </span>
+            <button
+              className="ghost"
+              onClick={goToNextWindow}
+              disabled={windowInfo.offset + EDITABLE_WINDOW_SIZE >= windowInfo.total}
+            >
+              Next ▶
+            </button>
+          </div>
+        )}
         <button onClick={handleSave} disabled={pendingCount === 0}>
           {pendingCount > 0 ? `Save (${pendingCount})` : 'Save'}
         </button>
@@ -790,16 +1106,26 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
       {gridError && <div className="errorBanner">{gridError}</div>}
       {searchError && <div className="errorBanner">{searchError}</div>}
 
+      {materializing && (
+        <div className="materializingNotice">
+          Indexing the full dataset in the background — browsing and editing work
+          normally now, Save will just wait a moment for indexing to finish if
+          clicked before it's done.
+        </div>
+      )}
+
       {pendingCount > 0 && (
         <div className="unsavedNotice">
           {pendingCount} unsaved change{pendingCount === 1 ? '' : 's'} — click Save to write to disk.
         </div>
       )}
 
-      {searchResultCount !== null && (
+      {activeSearch !== null && (
         <div className="searchResultsNotice">
-          Showing {searchResultCount} search result(s) — loaded directly into the grid below and
-          fully editable, same as any other cell. Clear search to go back to the full dataset.
+          {windowInfo.total.toLocaleString()} row{windowInfo.total === 1 ? '' : 's'} match
+          {windowInfo.total === 1 ? 'es' : ''} "{activeSearch}" — fully editable, same as any other
+          cell. {windowInfo.total > EDITABLE_WINDOW_SIZE ? 'Use Prev/Next to page through matches. ' : ''}
+          Clear search to go back to the full dataset.
         </div>
       )}
 
