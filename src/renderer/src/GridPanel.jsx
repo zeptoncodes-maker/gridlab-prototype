@@ -76,6 +76,8 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
   // __getInjector() escape hatch, to clear undo history after every
   // mount. See the comment in mountRowsIntoUniver for why that's needed.
   const univerRef = useRef(null);
+  const formulasRef = useRef({});            // persisted formulas, keyed rowId:column — reapplied on every mount
+  const pendingFormulasRef = useRef(new Map()); // formula edits staged but not yet saved
   const aggregatesRegisteredRef = useRef(false); // DB aggregate functions are registered once, after the first workbook exists — see registerAggregateFunctionsOnce
   const columnsRef = useRef([]); // index -> column name, index 0 is the header row's column 0
   const rowIdsRef = useRef([]); // sheet body row index (0-based, header excluded) -> DB row id
@@ -153,7 +155,9 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
   // setPendingCount directly, so the displayed count/Save button always
   // reflects both tracks together.
   function recalculatePendingCount() {
-    setPendingCount(pendingEditsRef.current.size + pendingFormatsRef.current.size);
+    setPendingCount(
+      pendingEditsRef.current.size + pendingFormatsRef.current.size + pendingFormulasRef.current.size
+    );
   }
 
   useEffect(() => {
@@ -312,17 +316,19 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
   // shape either way — search is just a filter on top of the same
   // windowing mechanism, not a separate hardcoded-200-row path anymore.
   async function loadWindow(offset, { autoFitColumns = true, statusLabel, whereClause, onError = setGridError } = {}) {
-    const [result, formatResult] = await Promise.all([
+    const [result, formatResult, formulaResult] = await Promise.all([
       whereClause
         ? window.gridlabAPI.grid.runQuery(whereClause, offset, EDITABLE_WINDOW_SIZE)
         : window.gridlabAPI.grid.getRows(offset, EDITABLE_WINDOW_SIZE),
       window.gridlabAPI.format.getAll(),
+      window.gridlabAPI.formula.getAll(),
     ]);
     if (result.error) {
       onError(result.error);
       return false;
     }
     formatsRef.current = formatResult?.formats || {};
+    formulasRef.current = formulaResult?.formulas || {};
     if (!whereClause && !result.datasetLoaded) {
       showEmptyState();
       return false;
@@ -369,6 +375,7 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     setMaterializing(false);
     pendingEditsRef.current = new Map();
     pendingFormatsRef.current = new Map();
+    pendingFormulasRef.current = new Map();
     setPendingCount(0);
     if (univerApiRef.current?.getActiveWorkbook()) {
       univerApiRef.current.disposeUnit(WORKBOOK_ID);
@@ -541,7 +548,37 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
         if (storedStyle !== undefined) {
           cell.s = storedStyle;
         }
+        // NEW (setFormula): reapply any stored formula the same way, and
+        // for the same reason — keyed by stable rowId so it survives
+        // search/paging mounting a different subset of rows. Setting `.f`
+        // makes Univer treat this as a live formula cell and recalculate
+        // it, rather than showing the stale value we happened to save.
+        // The DB value stays on `.v` as the fallback shown until that
+        // recalculation lands (relevant for async DBSUM-style functions).
+        const storedFormula = formulasRef.current[`${rowId}:${col}`];
+        if (storedFormula !== undefined && storedFormula !== null && storedFormula !== '') {
+          cell.f = storedFormula;
+        }
         cellData[r + 1][c] = cell;
+      });
+
+      // Reapply formulas stored in PADDING columns (keys like
+      // "__col4") — the loop above only walks real dataset columns, so
+      // without this pass a formula typed into the empty space beside the
+      // data would persist to formulas.json correctly but never come back
+      // on reload. Scanning per row keeps this keyed to the row's stable
+      // identity, exactly like every other stored formula.
+      Object.keys(formulasRef.current).forEach((key) => {
+        const sep = key.indexOf(':');
+        if (sep === -1) return;
+        if (key.slice(0, sep) !== String(rowId)) return;
+        const colPart = key.slice(sep + 1);
+        if (!colPart.startsWith('__col')) return;
+        const sheetCol = Number(colPart.slice(5));
+        if (!Number.isInteger(sheetCol)) return;
+        const storedFormula = formulasRef.current[key];
+        if (!storedFormula) return;
+        cellData[r + 1][sheetCol] = { ...(cellData[r + 1][sheetCol] || {}), f: storedFormula };
       });
     });
 
@@ -562,6 +599,7 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     originalValuesRef.current = freshOriginalValues;
     pendingEditsRef.current = new Map();
     pendingFormatsRef.current = new Map();
+    pendingFormulasRef.current = new Map();
     setPendingCount(0);
 
     const workbookData = {
@@ -780,21 +818,35 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
       for (const colKey of Object.keys(cellValue[rowKey])) {
         const sheetCol = Number(colKey);
         const column = columnsRef.current[sheetCol];
-        if (!column) continue;
+
+        // FIX (reported bug: a formula typed into an empty column showed
+        // the right answer but was never staged, never savable, and gone
+        // on reopen): this used to `continue` outright whenever the sheet
+        // column had no matching DATASET column — i.e. every one of the
+        // padding columns the grid renders past the real data (see the
+        // columnCount padding in mountRowsIntoUniver). That's precisely
+        // where people put formulas: in the empty space beside their data.
+        //
+        // A VALUE edit there genuinely has nowhere to go — there's no DB
+        // column to UPDATE — so those are still skipped. But a FORMULA
+        // doesn't live in DuckDB at all; it lives in formulas.json, so a
+        // padding column is a perfectly valid home for one. Such cells get
+        // a synthetic column key ("__col4") so they can't ever collide
+        // with a real column name, while still being keyed to the row's
+        // stable rowId like every other formula.
+        const isPaddingColumn = !column;
+        const formulaColumnKey = column || `__col${sheetCol}`;
 
         const cellDescriptor = cellValue[rowKey][colKey];
         const newValue = cellDescriptor?.v;
         const newStyle = cellDescriptor?.s;
-
-        // TEMPORARY DIAGNOSTIC — remove once format persistence is
-        // confirmed working end-to-end. Dumps the full cell descriptor
-        // whenever there's no value (a formatting-only change), so we can
-        // confirm the real shape of `.s` in this exact Univer version
-        // (docs say it's either a style-id string or an inline IStyleData
-        // object) before fully relying on it.
-        if (newValue === undefined) {
-          console.log('[diagnostic] style-only cell descriptor:', JSON.stringify(cellDescriptor));
-        }
+        // NEW (setFormula, spec §3.4): `.f` holds the formula STRING
+        // ("=DBSUM(...)"), while `.v` holds its computed RESULT. Both
+        // arrive on the same descriptor. We persist the formula and let
+        // the value ride along as a normal edit, so the underlying data
+        // still reflects the computed number for anything reading the
+        // file directly.
+        const newFormula = cellDescriptor?.f;
 
         // FIX: a pure formatting change (fill color, bold, etc.) fires
         // this SAME command id as a real value edit, but its cell
@@ -806,11 +858,56 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
         // ("Could not convert string 'undefined' to INT64"). A genuinely
         // cleared cell still carries a real value (null or ''), so this
         // doesn't block that — only a true style-only change skips here.
-        if (newValue !== undefined) {
+        // FIX (reported bug — confirmed via a real command trace, not
+        // guessed): entering an async formula like =DBSUM("salary") fires
+        // THREE separate sheet.mutation.set-range-values commands, not
+        // one: (1) the formula itself gets set, carrying `.f` with no
+        // `.v` at all; (2) Univer's formula engine INTERNALLY clears the
+        // cell to `v: null` while it recalculates — but this housekeeping
+        // step still carries the ORIGINAL `.f` string alongside that
+        // null; (3) once the async function resolves, the real computed
+        // result arrives as `.v` with no `.f`. Command (2) was being
+        // staged as if the user had typed a blank into the cell, since
+        // null !== undefined. The distinguishing signal: a genuine user
+        // clear would never carry `.f` at all, so a command with a
+        // truthy formula string ALONGSIDE v:null is unambiguously
+        // internal bookkeeping, not something to stage as a value edit.
+        const isFormulaRecalcHousekeeping = Boolean(newFormula) && newValue === null;
+        // Value edits and formatting only apply to REAL dataset columns —
+        // there's no database column behind a padding column to write to.
+        if (!isPaddingColumn && newValue !== undefined && !isFormulaRecalcHousekeeping) {
           stagePendingEdit(sheetRow, sheetCol, rowId, column, newValue);
         }
-        if (newStyle !== undefined) {
+        if (!isPaddingColumn && newStyle !== undefined) {
           stagePendingFormat(rowId, column, newStyle);
+        }
+        // A cell that HAD a formula and no longer does must clear its
+        // stored entry, not just skip — hence staging null rather than
+        // ignoring the undefined case, but only when this was a real
+        // value edit (a style-only change carries neither .v nor .f and
+        // must not wipe an existing formula).
+        // Formulas DO apply to padding columns — see the note above.
+        //
+        // FIX (reported bug: reopening a project always showed "1 unsaved
+        // change", and saving it would have DELETED the stored formula):
+        // this used to infer "the user cleared the formula" from "a value
+        // arrived and a formula is stored for this cell". Confirmed by a
+        // real command trace that this is exactly wrong — those two cases
+        // are cleanly distinguishable by whether the `f` KEY is present:
+        //
+        //   formula's async result  -> keys [v, t]      ... no `f` key
+        //   user overwrites/clears  -> keys [v, f]      ... f present, null
+        //
+        // So an ABSENT `f` says nothing about the formula (it's just the
+        // computed result landing) and must be ignored, while an
+        // explicitly-present `f: null` is a genuine clear. Checking for
+        // the key's presence rather than its value is the whole fix —
+        // `newFormula !== undefined` can't tell those two apart.
+        const hasFormulaKey =
+          cellDescriptor != null && Object.prototype.hasOwnProperty.call(cellDescriptor, 'f');
+        if (hasFormulaKey) {
+          // newFormula may legitimately be null here — that's a real clear.
+          stagePendingFormula(rowId, formulaColumnKey, newFormula);
         }
       }
     }
@@ -823,6 +920,17 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     // (persisted) value as the diff baseline, not the previous pending
     // edit — so the eventual diff/undo record reflects true before/after.
     const originalValue = existing ? existing.originalValue : originalValuesRef.current.get(key);
+    // Same principle as stagePendingFormula above: a "change" that matches
+    // the persisted value isn't a change. This catches the equivalent echo
+    // for a formula sitting in a REAL dataset column (whose recalculated
+    // result does get staged as a value edit), and more generally stops a
+    // cell edited back to its original value from counting as unsaved.
+    // String comparison deliberately matches how buildDiff in mutations.js
+    // already decides whether a cell actually `changed`.
+    if (String(originalValue) === String(newValue)) {
+      if (pendingEditsRef.current.delete(key)) recalculatePendingCount();
+      return;
+    }
     pendingEditsRef.current.set(key, { sheetRow, sheetCol, rowId, column, newValue, originalValue });
     recalculatePendingCount();
   }
@@ -836,6 +944,40 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
   // value edits — the backend decides at Save time whether there's
   // actually somewhere to persist it (only true failure: no project AND
   // no CSV ever loaded).
+  // NEW (setFormula, spec §3.4): formulas persist to formulas.json
+  // (project open) or a sidecar file next to the data file (no project) —
+  // deliberately the SAME mechanism formatting already uses, for the same
+  // reason: a formula is a rule for producing a value, not data. Writing
+  // "=DBSUM(salary)" into a 3M-row DuckDB column would corrupt its type
+  // and be meaningless to any other tool opening that CSV/Parquet.
+  // Keyed by stable rowId:column so it survives search/paging remounts.
+  function stagePendingFormula(rowId, column, newFormula) {
+    const key = `${rowId}:${column}`;
+    // FIX (reported bug: reopening a project showed "1 unsaved change"
+    // with nothing actually touched): restoring a stored formula at mount
+    // sets `.f` on the cell, which makes Univer recalculate it — and that
+    // recalculation fires the very same set-range-values commands a real
+    // user edit does. So the app was staging its OWN restoration as a
+    // pending change, on every single open.
+    // Suppressing by mount-timing wouldn't work: async formulas (DBSUM
+    // does a real IPC round-trip) resolve well after the mount finishes,
+    // long past any suppression window. The reliable signal is semantic
+    // rather than temporal — staging a formula IDENTICAL to the one
+    // already persisted isn't a change by definition, whenever it
+    // arrives. Same for clearing a formula that was never stored.
+    const stored = formulasRef.current[key];
+    const normalize = (f) => (f === null || f === undefined || f === '' ? null : f);
+    if (normalize(stored) === normalize(newFormula)) {
+      // Also drop any previously staged entry for this key — the cell has
+      // been edited back to exactly its saved state, so there's genuinely
+      // nothing left to save for it.
+      if (pendingFormulasRef.current.delete(key)) recalculatePendingCount();
+      return;
+    }
+    pendingFormulasRef.current.set(key, { rowId, column, newFormula });
+    recalculatePendingCount();
+  }
+
   function stagePendingFormat(rowId, column, newStyle) {
     const key = `${rowId}:${column}`;
     pendingFormatsRef.current.set(key, { rowId, column, newStyle });
@@ -874,7 +1016,12 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
   // being unavailable in Electron entirely, fixed earlier the same way —
   // raw browser dialogs just aren't reliable in this environment.
   async function confirmDiscardPendingEdits() {
-    const count = pendingEditsRef.current.size + pendingFormatsRef.current.size;
+    // FIX (same class of bug as the Save guard): this count also omitted
+    // pendingFormulasRef, so an unsaved formula would be silently thrown
+    // away by Reset/search/Open File with no warning at all — the exact
+    // data-loss this confirmation exists to prevent.
+    const count =
+      pendingEditsRef.current.size + pendingFormatsRef.current.size + pendingFormulasRef.current.size;
     if (count === 0) return true;
     const ok = await window.gridlabAPI.app.confirmDiscard(
       `You have ${count} unsaved change${count === 1 ? '' : 's'}. Discard ${count === 1 ? 'it' : 'them'} and continue?`
@@ -882,6 +1029,7 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
     if (ok) {
       pendingEditsRef.current = new Map();
       pendingFormatsRef.current = new Map();
+      pendingFormulasRef.current = new Map();
       setPendingCount(0);
     }
     return ok;
@@ -898,7 +1046,16 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
   async function handleSave() {
     const valueEntries = Array.from(pendingEditsRef.current.values());
     const formatEntries = Array.from(pendingFormatsRef.current.values());
-    if (valueEntries.length === 0 && formatEntries.length === 0) return;
+    // FIX (reported bug: Save showed "(1)" for a staged formula but
+    // clicking it did nothing): this guard was never updated when formula
+    // staging was added, so a formula-only save — the exact case of
+    // typing =DBSUM(...) into an empty cell and touching nothing else —
+    // returned here before reaching the formula commit block below. The
+    // pending COUNT already included formulas (recalculatePendingCount
+    // sums all three), which is why the button correctly enabled while
+    // doing nothing: the two halves disagreed about what counts as work.
+    const formulaEntriesCount = pendingFormulasRef.current.size;
+    if (valueEntries.length === 0 && formatEntries.length === 0 && formulaEntriesCount === 0) return;
     setGridError(null);
 
     const workbook = univerApiRef.current.getActiveWorkbook();
@@ -946,6 +1103,36 @@ export default function GridPanel({ projectDir, onDimsChange, onStatusChange, on
         // value edits, there's no confirmed API for restoring an
         // arbitrary earlier IStyleData, so the pending entries stay
         // staged (Save can be retried) rather than silently dropped.
+        failures.push({ error: result.error });
+      }
+    }
+
+    // NEW (setFormula): commit staged formulas, same shape as formats
+    // above. Ordered after them deliberately — nothing depends on the
+    // order, but keeping the two persistence tracks adjacent makes the
+    // parallel obvious to anyone reading this later.
+    const formulaEntries = Array.from(pendingFormulasRef.current.values());
+    if (formulaEntries.length > 0) {
+      const result = await window.gridlabAPI.formula.commit(
+        formulaEntries.map(({ rowId, column, newFormula }) => ({
+          key: `${rowId}:${column}`,
+          formula: newFormula,
+        }))
+      );
+      if (result.ok) {
+        // Mirror into the in-memory copy immediately, matching how
+        // formats does it — and delete (rather than store null) when a
+        // formula was cleared, since that's what the backend does on disk.
+        formulaEntries.forEach(({ rowId, column, newFormula }) => {
+          const key = `${rowId}:${column}`;
+          if (newFormula === null || newFormula === undefined || newFormula === '') {
+            delete formulasRef.current[key];
+          } else {
+            formulasRef.current[key] = newFormula;
+          }
+        });
+        pendingFormulasRef.current = new Map();
+      } else {
         failures.push({ error: result.error });
       }
     }

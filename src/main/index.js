@@ -183,6 +183,36 @@ ipcMain.handle('format:commit', async (event, entries) => {
   }
 });
 
+// --- Formula persistence (setFormula, spec §3.4) ------------------------
+// Same project-vs-sidecar resolution as formats above, for the same
+// reasons — formulas belong with the file they annotate, whether or not a
+// project happens to be open.
+function getFormulasFilePath() {
+  if (currentProjectDir) return path.join(currentProjectDir, 'formulas.json');
+  if (session.sourceFilePath) return `${session.sourceFilePath}.formulas.json`;
+  return null;
+}
+
+ipcMain.handle('formula:getAll', async () => {
+  const formulasPath = getFormulasFilePath();
+  if (!formulasPath) return { formulas: {} };
+  const formulas = await project.readFormulasFile(formulasPath);
+  return { formulas };
+});
+
+ipcMain.handle('formula:commit', async (event, entries) => {
+  const formulasPath = getFormulasFilePath();
+  if (!formulasPath) {
+    return { ok: false, error: "Open a file first — there's nowhere to save formulas yet." };
+  }
+  try {
+    await project.updateFormulasFile(formulasPath, entries);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
 // --- Dataset loading (same behavior as the original prototype) -----------
 
 ipcMain.handle('dataset:openCsvDialog', async () => {

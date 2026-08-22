@@ -10,13 +10,15 @@ import * as project from './project.js';
 //   insertColumn — ALTER TABLE ADD COLUMN (+ optional default fill)
 //   deleteColumn — ALTER TABLE DROP COLUMN  (NOT undoable — see below)
 //   renameColumn — ALTER TABLE RENAME COLUMN
+//   setFormula   — persists a cell's formula STRING to formulas.json
+//                  (project) or a sidecar file (no project). Deliberately
+//                  NOT stored in DuckDB: a formula is a rule for producing
+//                  a value, not data — writing "=DBSUM(salary)" into a
+//                  3M-row typed column would corrupt it and be meaningless
+//                  to any other tool reading that CSV/Parquet. Follows the
+//                  exact mechanism formatting already proved out.
 //
 // DELIBERATELY NOT IMPLEMENTED, and why (rather than stubbed to look done):
-//   setFormula  — formulas currently live only in Univer's own engine and
-//                 are never persisted to DuckDB. Making them a real
-//                 mutation means designing formula persistence first;
-//                 pretending otherwise would produce a mutation that
-//                 silently does nothing on reload.
 //   createView  — depends on the view-sheet/model-sheet split (§3.3),
 //                 which doesn't exist yet.
 //   createChart — there is no chart support anywhere in the app.
@@ -77,7 +79,7 @@ function describeMutations(mutations) {
 // named set so validate/diff/commit/undo all agree on the distinction
 // instead of each re-listing op names.
 const SCHEMA_OPS = new Set(['insertColumn', 'deleteColumn', 'renameColumn']);
-const SUPPORTED_OPS = new Set(['setCell', 'setRange', ...SCHEMA_OPS]);
+const SUPPORTED_OPS = new Set(['setCell', 'setRange', 'setFormula', ...SCHEMA_OPS]);
 
 // --- 2. VALIDATE --------------------------------------------------------
 // Schema-valid? Row in bounds? Column real? This is intentionally strict
@@ -112,6 +114,14 @@ export async function validateMutation(mutationSet, { session }) {
     if (m.op === 'setCell') {
       const err = checkCell(m.column, m.rowId);
       if (err) return { ok: false, error: err };
+    } else if (m.op === 'setFormula') {
+      const err = checkCell(m.column, m.rowId);
+      if (err) return { ok: false, error: err };
+      // A null/empty formula is legitimate — it means "this cell is no
+      // longer a formula" — so only a non-string non-null is rejected.
+      if (m.formula !== null && m.formula !== undefined && typeof m.formula !== 'string') {
+        return { ok: false, error: 'setFormula needs a formula string (or null to clear it).' };
+      }
     } else if (m.op === 'setRange') {
       if (!Array.isArray(m.cells) || m.cells.length === 0) {
         return { ok: false, error: 'setRange needs a non-empty cells array.' };

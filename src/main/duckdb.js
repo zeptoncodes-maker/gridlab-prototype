@@ -1,4 +1,5 @@
 import duckdbPkg from '@duckdb/node-api';
+import { queryToArrowIPC } from './arrow.js';
 
 const duckdb = duckdbPkg;
 
@@ -386,6 +387,48 @@ export class DuckDBSession {
     const countResult = await conn.run(`SELECT COUNT(*) AS n FROM dataset`);
     const countRows = await countResult.getRowObjects();
     return { rows, totalRows: Number(countRows[0].n), materializing: false };
+  }
+
+  // NEW (Arrow integration): the Arrow-producing counterpart to getRows
+  // above. Mirrors its exact live/materialized branching logic — same
+  // row_id addressing, same liveRowCount caching — the only difference is
+  // the DATA page comes back as real Arrow IPC bytes (via arrow.js, which
+  // itself only wraps DuckDB's own to_arrow_ipc()) instead of row objects.
+  // The row COUNT stays a plain scalar query either way — there's no
+  // benefit to Arrow-encoding a single number.
+  //
+  // Returns { arrow: Uint8Array, totalRows, materializing } on success, or
+  // { arrow: null, error, totalRows, materializing } if Arrow isn't
+  // available (e.g. offline, extension blocked) — callers must fall back
+  // to plain getRows() in that case rather than treating this as fatal.
+  async getRowsAsArrow(offset, limit) {
+    if (!this.datasetLoaded) return { arrow: null, totalRows: 0, materializing: false };
+    const conn = await this.getConnection();
+
+    if (this.materializing) {
+      const reader = this._sourceReader();
+      const sql = `SELECT row_number() OVER () + ${offset} AS row_id, * FROM (
+         SELECT * FROM ${reader} LIMIT ${limit} OFFSET ${offset}
+       )`;
+      const arrowResult = await queryToArrowIPC(conn, sql);
+      if (this.liveRowCount === null) {
+        const countResult = await conn.run(`SELECT COUNT(*) AS n FROM ${reader}`);
+        const countRows = await countResult.getRowObjects();
+        this.liveRowCount = Number(countRows[0].n);
+      }
+      return arrowResult.error
+        ? { arrow: null, error: arrowResult.error, totalRows: this.liveRowCount, materializing: true }
+        : { arrow: arrowResult.bytes, totalRows: this.liveRowCount, materializing: true };
+    }
+
+    const sql = `SELECT * FROM dataset LIMIT ${limit} OFFSET ${offset}`;
+    const arrowResult = await queryToArrowIPC(conn, sql);
+    const countResult = await conn.run(`SELECT COUNT(*) AS n FROM dataset`);
+    const countRows = await countResult.getRowObjects();
+    const totalRows = Number(countRows[0].n);
+    return arrowResult.error
+      ? { arrow: null, error: arrowResult.error, totalRows, materializing: false }
+      : { arrow: arrowResult.bytes, totalRows, materializing: false };
   }
 
   async runQuery(whereClause, offset, limit) {

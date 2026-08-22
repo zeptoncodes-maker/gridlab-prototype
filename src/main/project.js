@@ -32,12 +32,12 @@ export const SCHEMA_VERSION = 1;
 // position, so formatting survives search/reset (which mount a different
 // subset/order of rows) and reopening the project.
 //
-// Formatting only persists inside a project — a bare CSV opened without
-// one stays exactly a plain, standard CSV, with nothing GridLab-specific
-// added alongside it (readFormatsFile/updateFormatsFile below take a
-// resolved path directly rather than assuming a project directory only
-// because that's convenient to call from main/index.js's getFormatsFilePath
-// — not because there's meant to be more than one caller pattern for it).
+// This file lives at manifest.json's side ONLY when a project is open. A
+// CSV opened with no project gets its own sidecar file instead (e.g.
+// data.csv.formats.json, next to data.csv) — see getFormatsFilePath() in
+// main/index.js, which decides which of the two applies. This mirrors how
+// value edits already persist without a project (straight back into the
+// CSV, via exportToCsv in duckdb.js) — formatting gets the same treatment.
 
 export async function createProject(dirPath, { name }) {
   await fs.mkdir(dirPath, { recursive: true });
@@ -53,6 +53,7 @@ export async function createProject(dirPath, { name }) {
   await writeJson(path.join(dirPath, 'workbook.json'), { loadedRowWindow: { offset: 0, limit: 0 } });
   await fs.writeFile(path.join(dirPath, 'mutations.ndjson'), '', 'utf8');
   await writeJson(path.join(dirPath, 'formats.json'), {});
+  await writeJson(path.join(dirPath, 'formulas.json'), {});
 
   return { dirPath, manifest };
 }
@@ -140,11 +141,13 @@ export function localDuckdbPath(dirPath) {
 // A flat { "rowId:column": IStyleData } map — see the file-map comment at
 // the top of this file for why this is separate from mutations.ndjson.
 //
-// These take a fully-resolved file path directly rather than a project
-// directory purely because that's what main/index.js's getFormatsFilePath
-// already has on hand to pass in — not because there's more than one kind
-// of caller. Formatting only ever persists inside a project's own
-// formats.json; a bare CSV stays exactly a plain, standard CSV.
+// These take a fully-resolved file path directly, not a project
+// directory — the caller (main/index.js) decides WHERE that lives: inside
+// the open project as formats.json if one's open, or as a sidecar file
+// next to the CSV itself (e.g. data.csv.formats.json) if not. That mirrors
+// how value edits already work without a project (exportToCsv in
+// duckdb.js writes straight back to the CSV regardless of project state)
+// — formatting now gets the same treatment via its own sidecar file.
 
 export async function readFormatsFile(filePath) {
   try {
@@ -169,6 +172,44 @@ export async function updateFormatsFile(filePath, entries) {
       delete current[key];
     } else {
       current[key] = style;
+    }
+  }
+  await writeJson(filePath, current);
+  return current;
+}
+
+// --- Formula persistence (setFormula, spec §3.4) -------------------------
+// Deliberately mirrors the formats.json mechanism above rather than
+// inventing a new one — same shape, same rationale, same sidecar-vs-project
+// resolution done by the caller.
+//
+// WHY A SIDECAR AND NOT DUCKDB: a formula isn't data, it's a rule for
+// producing data. DuckDB stores the dataset's VALUES; putting "=DBSUM(...)"
+// in a cell of a 3M-row table would corrupt the column's type and mean
+// nothing to any other tool reading that CSV/Parquet. Formatting hit the
+// exact same wall and was solved the exact same way — so formulas follow
+// the precedent that's already proven in this codebase rather than a new
+// design.
+//
+// A flat { "rowId:column": "=FORMULA(...)" } map. A null/undefined formula
+// DELETES the key (the cell went back to being a plain value).
+
+export async function readFormulasFile(filePath) {
+  try {
+    const raw = await fs.readFile(filePath, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+export async function updateFormulasFile(filePath, entries) {
+  const current = await readFormulasFile(filePath);
+  for (const { key, formula } of entries) {
+    if (formula === null || formula === undefined || formula === '') {
+      delete current[key];
+    } else {
+      current[key] = formula;
     }
   }
   await writeJson(filePath, current);

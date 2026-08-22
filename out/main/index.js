@@ -410,6 +410,7 @@ async function createProject(dirPath, { name }) {
   await writeJson(path.join(dirPath, "workbook.json"), { loadedRowWindow: { offset: 0, limit: 0 } });
   await fs.writeFile(path.join(dirPath, "mutations.ndjson"), "", "utf8");
   await writeJson(path.join(dirPath, "formats.json"), {});
+  await writeJson(path.join(dirPath, "formulas.json"), {});
   return { dirPath, manifest };
 }
 async function openProject(dirPath) {
@@ -476,6 +477,26 @@ async function updateFormatsFile(filePath, entries) {
   await writeJson(filePath, current);
   return current;
 }
+async function readFormulasFile(filePath) {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+async function updateFormulasFile(filePath, entries) {
+  const current = await readFormulasFile(filePath);
+  for (const { key, formula } of entries) {
+    if (formula === null || formula === void 0 || formula === "") {
+      delete current[key];
+    } else {
+      current[key] = formula;
+    }
+  }
+  await writeJson(filePath, current);
+  return current;
+}
 async function writeJson(filePath, data) {
   await fs.writeFile(filePath, JSON.stringify(data, null, 2), "utf8");
 }
@@ -488,7 +509,7 @@ function proposeMutation({ rowId, column, newValue, origin }) {
   };
 }
 const SCHEMA_OPS = /* @__PURE__ */ new Set(["insertColumn", "deleteColumn", "renameColumn"]);
-const SUPPORTED_OPS = /* @__PURE__ */ new Set(["setCell", "setRange", ...SCHEMA_OPS]);
+const SUPPORTED_OPS = /* @__PURE__ */ new Set(["setCell", "setRange", "setFormula", ...SCHEMA_OPS]);
 async function validateMutation(mutationSet, { session: session2 }) {
   const schema = await session2.getSchema();
   const schemaColumns = new Set(schema.map((c) => c.name));
@@ -511,6 +532,12 @@ async function validateMutation(mutationSet, { session: session2 }) {
     if (m.op === "setCell") {
       const err = checkCell(m.column, m.rowId);
       if (err) return { ok: false, error: err };
+    } else if (m.op === "setFormula") {
+      const err = checkCell(m.column, m.rowId);
+      if (err) return { ok: false, error: err };
+      if (m.formula !== null && m.formula !== void 0 && typeof m.formula !== "string") {
+        return { ok: false, error: "setFormula needs a formula string (or null to clear it)." };
+      }
     } else if (m.op === "setRange") {
       if (!Array.isArray(m.cells) || m.cells.length === 0) {
         return { ok: false, error: "setRange needs a non-empty cells array." };
@@ -818,6 +845,29 @@ electron.ipcMain.handle("format:commit", async (event, entries) => {
   }
   try {
     await updateFormatsFile(formatsPath, entries);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+function getFormulasFilePath() {
+  if (currentProjectDir) return path.join(currentProjectDir, "formulas.json");
+  if (session.sourceFilePath) return `${session.sourceFilePath}.formulas.json`;
+  return null;
+}
+electron.ipcMain.handle("formula:getAll", async () => {
+  const formulasPath = getFormulasFilePath();
+  if (!formulasPath) return { formulas: {} };
+  const formulas = await readFormulasFile(formulasPath);
+  return { formulas };
+});
+electron.ipcMain.handle("formula:commit", async (event, entries) => {
+  const formulasPath = getFormulasFilePath();
+  if (!formulasPath) {
+    return { ok: false, error: "Open a file first — there's nowhere to save formulas yet." };
+  }
+  try {
+    await updateFormulasFile(formulasPath, entries);
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err.message };

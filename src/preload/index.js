@@ -23,6 +23,10 @@ contextBridge.exposeInMainWorld('gridlabAPI', {
   app: {
     confirmDiscard: (message) => ipcRenderer.invoke('app:confirmDiscard', message),
   },
+  formula: {
+    getAll: () => ipcRenderer.invoke('formula:getAll'),
+    commit: (entries) => ipcRenderer.invoke('formula:commit', entries),
+  },
   format: {
     getAll: () => ipcRenderer.invoke('format:getAll'),
     commit: (entries) => ipcRenderer.invoke('format:commit', entries),

@@ -22,6 +22,10 @@ electron.contextBridge.exposeInMainWorld("gridlabAPI", {
   app: {
     confirmDiscard: (message) => electron.ipcRenderer.invoke("app:confirmDiscard", message)
   },
+  formula: {
+    getAll: () => electron.ipcRenderer.invoke("formula:getAll"),
+    commit: (entries) => electron.ipcRenderer.invoke("formula:commit", entries)
+  },
   format: {
     getAll: () => electron.ipcRenderer.invoke("format:getAll"),
     commit: (entries) => electron.ipcRenderer.invoke("format:commit", entries)
